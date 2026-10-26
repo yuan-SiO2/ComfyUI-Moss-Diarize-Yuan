@@ -10,6 +10,32 @@
 
 ---
 
+## 项目来源与区别
+
+**来源参考：[T8mars/Comfyui-MOSS-Transcribe-Diarize-T8](https://github.com/T8mars/Comfyui-MOSS-Transcribe-Diarize-T8)（Apache-2.0，作者 T8star-Aix）。**
+
+同一个底层模型（[OpenMOSS/MOSS-Transcribe-Diarize](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize)）的 ComfyUI 集成，T8 那份是先行者：本项目的模型固定 revision、需要哪些权重文件、`processor` 直接吃 16 kHz 原始波形的用法，都是先看它的实现与 manifest 才确认的。
+
+**本项目不是它的 fork**（没有复制其代码），而是按「自包含、零依赖、两节点」思路另写的一套实现。区别如下：
+
+| 方面 | T8（ComfyUI-MOSS-Transcribe-Diarize-T8） | 本项目（ComfyUI-Moss-Diarize-Yuan） |
+|---|---|---|
+| 节点数量 | 15 个，V3 API（`comfy_entrypoint` / `io.Schema`） | **2 个**，V1 API（`NODE_CLASS_MAPPINGS`） |
+| 权重位置 | `ComfyUI/models/moss_transcribe_diarize/`，明确要求**不进** `custom_nodes` | **就在插件目录内** `models/MOSS-Transcribe-Diarize/`，整个插件可搬走 |
+| 额外依赖 | 11 个（`av` `librosa` `numba` `soundfile` `soxr` `webrtcvad-wheels` …） | **0 个**（只用 ComfyUI 自带的 transformers / torch / torchaudio） |
+| 获取权重 | 手动跑 `scripts/download_models.py` | 启动时自动补齐、节点执行时等待；**ModelScope 国内源优先**，HF 回退 |
+| 音频处理 | 落临时 wav，经 ffmpeg / soundfile 读盘 | 内存内下混 + 重采样直接喂 `processor`，无临时文件 |
+| 长音频 | VAD 切片、重叠去重、检查点续跑 | **单次前向**（约 ≤10 分钟舒适），未做切片 |
+| 词级时间戳 | 外挂 `whisper-small` 对齐节点 | 无，只有句/段级 |
+| 跨块声纹 | 外挂 WavLM X-Vector 聚类 | 无 |
+| 质量门 | 尾部覆盖、未知说话人、重复循环、截断检测 | 只有解析容错（丢弃缺尾段、夹正倒退时间），无质量闸门 |
+| 远程推理 | 支持 SGLang Omni / vLLM 的 OpenAI 兼容接口 | 无，纯本地 |
+| 界面语言 | `locales/zh|en/nodeDefs.json` 翻译层 | **接口键名直接中文**，任何 UI 语言下都显示中文 |
+| 完整性校验 | 固定 manifest 逐文件 SHA-256 | 权重校验精确字节数，下载时比对 `Content-Length` |
+
+**取舍**：本项目放弃 T8 那套长音频切片、词级对齐、声纹关联与质量门，换取「丢进 `custom_nodes` 就能用、不装任何包、不折腾路径」。
+如果你要处理 30 分钟以上的会议录音，或需要词级时间戳与质量报告，建议直接用 T8 那份。
+
 ## 目录结构
 
 ```
@@ -136,6 +162,8 @@ git clone <本仓库> ComfyUI-Moss-Diarize-Yuan
 - 静音、音乐、噪声上仍可能出现幻觉、提前结束或重复段落，重要结果需人工复核。
 - CPU 可以跑（fp32），但很慢。
 
-## 许可证
+## 许可证与致谢
 
-节点代码 Apache-2.0。模型权重版权归 OpenMOSS Team，Apache-2.0。本项目不是 OpenMOSS 官方发行物。
+- **模型权重**：版权归 OpenMOSS Team，Apache-2.0。本项目不是 OpenMOSS 官方发行物。
+- **实现来源参考**：[T8mars/Comfyui-MOSS-Transcribe-Diarize-T8](https://github.com/T8mars/Comfyui-MOSS-Transcribe-Diarize-T8)（Apache-2.0，作者 T8star-Aix）。本项目未复制其代码，但模型固定 revision、必需文件清单与 `processor` 调用方式参考了该项目的公开实现，特此致谢。
+- **本项目代码**：Apache-2.0。
