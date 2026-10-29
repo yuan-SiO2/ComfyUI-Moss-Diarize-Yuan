@@ -469,6 +469,9 @@ async def _run_render(
         if path is not None:
             caps[asset_id] = await _probe_streams(path)
 
+    canvas = timeline.get("canvas") or {}
+    width = int(canvas.get("width") or 1920)
+    height = int(canvas.get("height") or 1080)
     output_cfg = timeline.get("output") or {}
     out_w = int(output_cfg.get("width") or width)
     out_h = int(output_cfg.get("height") or height)
@@ -482,9 +485,6 @@ async def _run_render(
 
     duration = _num(timeline.get("duration"), 0)
     fps = int(timeline.get("fps") or 30)
-    canvas = timeline.get("canvas") or {}
-    width = int(canvas.get("width") or 1920)
-    height = int(canvas.get("height") or 1080)
     profile = timeline.get("profile") or {}
 
     work_dir = work or Path(tempfile.mkdtemp(prefix="yuancut-render-"))
