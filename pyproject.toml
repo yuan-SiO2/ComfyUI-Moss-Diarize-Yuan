@@ -1,0 +1,11 @@
+[project]
+name = "comfyui-yuancut"
+description = "在 ComfyUI 内打开 YuanCut 视频编辑器：静态前端由插件托管在 /yuancut，节点或顶栏按钮即可打开"
+version = "0.1.0"
+license = { file = "LICENSE" }
+dependencies = []
+
+[tool.comfy]
+DisplayName = "ComfyUI YuanCut"
+Icon = ""
+includes = ["js", "yuancut-ui"]

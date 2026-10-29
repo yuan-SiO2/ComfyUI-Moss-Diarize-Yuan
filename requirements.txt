@@ -1,0 +1,7 @@
+# ComfyUI-YuanCut 不需要额外的 Python 依赖：
+# aiohttp 由 ComfyUI 自带，前端是 yuancut-ui/ 里的纯静态文件。
+#
+# 系统依赖（非 pip）：
+#   ffmpeg —— 浏览器（尤其 Linux 上的 Chromium）没有 AAC 音频编码器，
+#   MP4 导出时由本机 ffmpeg 把「无声视频 + WAV 音轨」交织封装成带 AAC 的 MP4。
+#   找不到 ffmpeg 时会退化成导出无声视频（编辑器里会有控制台警告）。

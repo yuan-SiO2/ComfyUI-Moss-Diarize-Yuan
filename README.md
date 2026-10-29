@@ -1,169 +1,218 @@
-# ComfyUI-Moss-Diarize-Yuan
+# ComfyUI-YuanCut
 
-**自包含的 MOSS-Transcribe-Diarize ComfyUI 节点。模型权重就在本插件目录里，装进去就能用。**
+在 ComfyUI 里直接使用 YuanCut 视频编辑器：一个纯前端、本地优先的剪辑器，
+界面由打包进插件的静态前端提供，不需要 Node 进程、数据库或上传素材。
 
-不写 `ComfyUI/models`，不配 `extra_model_paths.yaml`，不需要另外跑下载脚本，也不额外安装 Python 依赖（除非你的 ComfyUI 环境里连 `transformers` / `torch` 都没有）。
+集成方式：**静态前端 + ComfyUI 自带 aiohttp 托管 + 节点/顶栏入口 + iframe 弹层**。
 
-- 模型：[OpenMOSS-Team/MOSS-Transcribe-Diarize](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize)（0.9B，Apache-2.0）
-- 一次前向同时给出**转写文本 + 句级时间戳 + 说话人编号**，50+ 语言
-- 固定 revision `e8681d68e7042738ffca8ac8212bc8fcb1131ab8`
+- 打开即进入 **所有项目**，点项目才进入编辑器
+- 素材与项目都存在浏览器 IndexedDB（与 ComfyUI 同源），不上传
+- 一个 `YuanCut` 节点 + 顶栏 `YuanCut` 按钮，双击节点或右键菜单也能打开
+- 关闭弹层后 iframe 常驻内存，再次打开秒开，编辑状态不丢
+- 界面固定中文（内置编辑器直接以 zh 打开，插件按钮/提示/说明均为中文）
 
----
-
-## 项目来源与区别
-
-**来源参考：[T8mars/Comfyui-MOSS-Transcribe-Diarize-T8](https://github.com/T8mars/Comfyui-MOSS-Transcribe-Diarize-T8)（Apache-2.0，作者 T8star-Aix）。**
-
-同一个底层模型（[OpenMOSS/MOSS-Transcribe-Diarize](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize)）的 ComfyUI 集成，T8 那份是先行者：本项目的模型固定 revision、需要哪些权重文件、`processor` 直接吃 16 kHz 原始波形的用法，都是先看它的实现与 manifest 才确认的。
-
-**本项目不是它的 fork**（没有复制其代码），而是按「自包含、零依赖、两节点」思路另写的一套实现。区别如下：
-
-| 方面 | T8（ComfyUI-MOSS-Transcribe-Diarize-T8） | 本项目（ComfyUI-Moss-Diarize-Yuan） |
-|---|---|---|
-| 节点数量 | 15 个，V3 API（`comfy_entrypoint` / `io.Schema`） | **2 个**，V1 API（`NODE_CLASS_MAPPINGS`） |
-| 权重位置 | `ComfyUI/models/moss_transcribe_diarize/`，明确要求**不进** `custom_nodes` | **就在插件目录内** `models/MOSS-Transcribe-Diarize/`，整个插件可搬走 |
-| 额外依赖 | 11 个（`av` `librosa` `numba` `soundfile` `soxr` `webrtcvad-wheels` …） | **0 个**（只用 ComfyUI 自带的 transformers / torch / torchaudio） |
-| 获取权重 | 手动跑 `scripts/download_models.py` | 启动时自动补齐、节点执行时等待；**ModelScope 国内源优先**，HF 回退 |
-| 音频处理 | 落临时 wav，经 ffmpeg / soundfile 读盘 | 内存内下混 + 重采样直接喂 `processor`，无临时文件 |
-| 长音频 | VAD 切片、重叠去重、检查点续跑 | **单次前向**（约 ≤10 分钟舒适），未做切片 |
-| 词级时间戳 | 外挂 `whisper-small` 对齐节点 | 无，只有句/段级 |
-| 跨块声纹 | 外挂 WavLM X-Vector 聚类 | 无 |
-| 质量门 | 尾部覆盖、未知说话人、重复循环、截断检测 | 只有解析容错（丢弃缺尾段、夹正倒退时间），无质量闸门 |
-| 远程推理 | 支持 SGLang Omni / vLLM 的 OpenAI 兼容接口 | 无，纯本地 |
-| 界面语言 | `locales/zh|en/nodeDefs.json` 翻译层 | **接口键名直接中文**，任何 UI 语言下都显示中文 |
-| 完整性校验 | 固定 manifest 逐文件 SHA-256 | 权重校验精确字节数，下载时比对 `Content-Length` |
-
-**取舍**：本项目放弃 T8 那套长音频切片、词级对齐、声纹关联与质量门，换取「丢进 `custom_nodes` 就能用、不装任何包、不折腾路径」。
-如果你要处理 30 分钟以上的会议录音，或需要词级时间戳与质量报告，建议直接用 T8 那份。
-
-## 目录结构
-
-```
-ComfyUI-Moss-Diarize-Yuan/
-├── __init__.py          节点注册 + 启动时检查插件内模型
-├── moss_nodes.py        2 个节点（音频转文本 / 保存字幕）
-├── moss_engine.py       加载 / 音频适配 / 生成 / 解析 / 字幕
-├── moss_download.py     插件内模型目录的自愈下载
-└── models/
-    └── MOSS-Transcribe-Diarize/   ← 权重就在这里（约 1.71 GiB，16 个文件）
-        ├── model-00000-of-00001.safetensors
-        ├── config.json  modeling_*.py  processing_*.py  ...
-        └── tokenizer.json  vocab.json  merges.txt  ...
-```
-
-模型路径是相对插件自身计算的（`Path(__file__).parent / "models" / "MOSS-Transcribe-Diarize"`），**整个插件目录可以整体搬走、改名字、放到任何 custom_nodes 路径下**，路径都不会错。
+![YuanCut 在 ComfyUI 里的弹层](docs/preview.jpg)
 
 ## 安装
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone <本仓库> ComfyUI-Moss-Diarize-Yuan
-# 重启 ComfyUI
+git clone <this-repo> ComfyUI-YuanCut      # 或者直接把目录复制/软链进来
 ```
 
-就这样。首次启动时插件会检查 `models/MOSS-Transcribe-Diarize/`：
+重启 ComfyUI，刷新前端页面即可。`yuancut-ui/` 已随仓库提供，开箱即用。
 
-| 情况 | 行为 |
-|---|---|
-| 目录已完整（权重随插件一起带了） | 直接可用，不联网 |
-| 目录缺失或不完整 | **ComfyUI 启动时后台自动下载到该目录**，不阻塞界面；节点执行时若还没下完会等它下完 |
-| 想自己手动放 | 把 16 个文件塞进 `models/MOSS-Transcribe-Diarize/` 即可 |
+## 使用
 
-### 开关
+三种入口，效果相同：
 
-| 环境变量 | 默认 | 含义 |
-|---|---|---|
-| `MOSS_AUTODOWNLOAD` | `1` | 设 `0` 关闭启动时自动下载（纯离线部署） |
-| `MOSS_DOWNLOAD_SOURCE` | 自动 | 强制下载源：`modelscope`（默认优先）／`huggingface` |
-| `HF_ENDPOINT` | 自动探测 | 只在走 HuggingFace 时生效，强制指定 HF 镜像地址 |
+1. 新建节点 → 分类 **YuanCut** → **YuanCut 视频编辑器**，点节点里的「打开 YuanCut」
+2. 双击该节点，或右键节点 →「打开 YuanCut 编辑器」
+3. ComfyUI 顶栏的 **YuanCut** 按钮
 
-### 下载源说明
+打开后直接落在 **所有项目**，点某个项目才进入编辑器。
+弹层右上角还有：**项目**（回到项目列表）、**重新加载**（重载当前页）、**新标签页**、**关闭**。
+也可以直接访问 `http://<comfyui>:8188/yuancut/`（自动落到项目列表）或 `/yuancut/zh/editor/`。
 
-优先级：**ModelScope 国内源 → huggingface.co → hf-mirror.com**。
+## 目录结构
 
-- **默认 ModelScope**：`openmoss/MOSS-Transcribe-Diarize`，国内直连，实测 **25 MiB/s**，1.7 GiB 约 70 秒。
-- **为什么不再默认 HF 镜像**：hf-mirror 会把下载重定向到 HuggingFace 的 **Xet CAS 服务器**（`cas-server.xethub.hf.co`），
-  该端点需要鉴权，国内直连会报 `401 Unauthorized`。插件已设置 `HF_HUB_DISABLE_XET=1` 强制走经典 HTTP，
-  但 ModelScope 仍然更快更稳，所以作为首选。
-- **逐文件下载**：只补缺失/大小不符的文件，支持断点续传（HTTP Range）、`Content-Length` 校验、失败重试 3 次。
-- **纯 HF 环境**：`MOSS_DOWNLOAD_SOURCE=huggingface` 可强制走 HF。
+```
+ComfyUI-YuanCut/
+├── __init__.py             # /yuancut 静态路由 + WEB_DIRECTORY
+├── nodes.py                # YuanCut 节点（OUTPUT_NODE，不参与采样）
+├── js/
+│   └── yuancut-launcher.js  # 节点 UI、顶栏按钮、iframe 弹层
+├── yuancut-ui/              # 前端静态导出（Next.js output: export）
+├── tools/
+│   ├── build_ui.sh          # 从源码重建 yuancut-ui/
+│   └── patch_webapp.py      # 静态化 + /yuancut basePath + 品牌替换补丁
+├── pyproject.toml
+└── requirements.txt
+```
 
-## 节点
+## 重建 yuancut-ui/
 
-### MOSS 音频转文本
+`yuancut-ui/` 是前端 `apps/web` 的静态导出产物。升级上游源码后重新生成：
 
-界面全中文：节点标题、输入接口名、输出接口名、控件选项、提示说明、控制台日志都是中文。接口键名直接用中文，
-所以在任何 UI 语言下显示的都是中文，**不依赖 locales 翻译是否命中**。
+```bash
+tools/build_ui.sh /path/to/webapp-source
+```
 
-| 输入 | 说明 |
-|---|---|
-| `音频` | 标准 ComfyUI `AUDIO`（接「加载音频」） |
-| `提示词预设` | 4 种：带时间戳与说话人（默认）／**带时间戳，不带说话人**／只要纯文本／英文转写（含说话人） |
-| `最大生成长度` | 默认 4096。1 分钟语音约 300–600 token，长音频要调大，否则截断 |
-| `跑完卸载模型` | **开关**：跑完就卸载／跑完留显存。默认「跑完留显存」，连续转写更快 |
-| `自定义提示词` | 可选，填了就以它为准，覆盖预设 |
-| `热词` | 可选，专有名词/人名/品牌名，逗号分隔，追加到提示词末尾 |
-| `说话人改名` | 可选，`S01=张三,S02=李四`，留空保持原编号 |
-| `精度` | 自动／bf16／fp16／fp32 |
-| `注意力后端` | sdpa（推荐）／自动／flash_attention_2（需另装）／eager（慢，长音频爆显存） |
-| `推理设备` | 自动／显卡 CUDA／处理器 CPU（很慢） |
-| `最大序列长度` | 默认 131072，约可容纳 2.9 小时音频的音频 token |
+脚本会：复制源码到临时目录（**不会改动你的仓库**）→ 应用 `tools/patch_webapp.py`
+→ `pnpm install` → `next build`（`output: "export"`）→ 把 `out/` 同步到 `yuancut-ui/`。
+需要 `pnpm`、`python3`、`rsync`，首次安装依赖约 1.3 GB。
 
-输出：`文本`（模型原始输出）、`SRT 字幕`、`VTT 字幕`、`分段 JSON`。
+### 静态化都改了什么
 
-### MOSS 保存字幕
+| 改动 | 原因 |
+| --- | --- |
+| `output: "export"` + `basePath: "/yuancut"` + `trailingSlash` | 交给 ComfyUI 托管，资源不与 `/_next` 冲突 |
+| 编辑器路由从 `/editor/<uuid>` 改为 `/editor?project=<uuid>` | 静态导出无法预渲染任意 uuid 的动态路由 |
+| 删除 `src/app/api/**`、`middleware.ts` | 静态站点没有服务端 |
+| 删除 `lib/auth`、`lib/db`、`lib/r2`、`lib/rate-limit` | 只被已删除的 API 使用，且与新版依赖类型不兼容 |
+| 移除 `botid` 与统计脚本 | 纯本地插件不引外链 |
+| 公开资源改用 `withBasePath()`，logo 目录改为 `logos/yuancut` | 资源要走 `/yuancut` 前缀 |
+| `next/image` 关闭优化 | 静态导出没有图片优化服务 |
+| 删除首页与营销页（`/[locale]/page.tsx`、privacy、terms、roadmap、why-not-capcut、playground）及其 `landing`/`header`/`footer` 组件、`public/preview` 素材 | 入口直接是「所有项目」，静态包里不再需要官网页面 |
+| 构建后清理 `locales/`、`preview/`，图标只保留 manifest 引用的 192/512，删除未引用的历史图标与 `logos/others` | 运行时不会请求这些文件，纯减体积 |
+| 品牌词与 manifest/locales/页面标题统一替换为 **YuanCut** | 插件内不再出现旧名字 |
 
-| 输入 | 说明 |
-|---|---|
-| `字幕内容` | 接上一个节点的任一字符串输出 |
-| `格式` | SRT 字幕／VTT 字幕／纯文本／分段 JSON |
-| `文件名前缀` | 默认 `moss_diarize`，生成 `moss_diarize_20250101-120000.srt` |
-| `加时间戳` | **开关**：带时间戳／只用前缀。关掉后重名会自动加 `_1`、`_2` |
+## 已知限制
 
-输出：`文件路径`。文件写入 `ComfyUI/output/`。
+静态版只保留**编辑器本身**。依赖服务端的入口在构建时已处理：
 
-> 整个插件只有这 **2 个节点**。释放显存不需要单独挂节点——转写节点上的 `跑完卸载模型` 开关就是干这个的。
-> 模型路径与完整性在启动时打印到控制台（`[MOSS本地] 模型已就绪 ...`），也不需要单独的「模型状态」节点。
+- Freesound 音效搜索（`/api/sounds/*`）的标签页已隐藏
+- AI 代理 / 文生图 / 文生视频（`/api/ai/*`）、参考图上传（`/api/upload/*`）、
+  文本转语音（`/api/tts/*`）、反馈（`/api/feedback`）、账号登录：按钮仍在，
+  但请求会 404，需要服务端才能用
+- 官网页面（首页、隐私、条款、路线图、why-not-capcut、playground）已从构建中移除，
+  只保留编辑器、项目列表和角色页
 
-## 实现要点（也是踩过的坑）
+时间线、预览、字幕、素材导入、本地导出（FFmpeg.wasm / mediabunny）等纯前端能力不受影响。
+项目保存在浏览器 IndexedDB：换浏览器或清站点数据会看不到旧项目。
 
-1. **零额外依赖**。processor 的 `__call__(text=..., audio=[waveform])` 直接吃 16 kHz 单声道 `np.float32` 数组，内部自己切 30 秒窗口。所以**不需要** ffmpeg / soundfile / librosa / soxr，也不需要写临时 wav 文件。重采样用 `torchaudio.functional.resample`，没有 torchaudio 时退化为线性插值。
-2. **音频适配**。ComfyUI 的 `AUDIO` 是 `[B, C, T]` 的 44.1 kHz float32 → 取 batch 0、声道求均值下混、重采样到 16 kHz。
-3. **attention 必须显式管**。`eager` 在长音频下显存**平方级**增长会直接 OOM。默认 `sdpa`，加载失败会按 `flash_attention_2 → sdpa → eager` 依次回退并把每次失败原因打到控制台。
-4. **输出解析**。模型输出是紧凑格式 `[0.48][S01]正文[1.66][12.26][S02]正文[13.81]`，时间戳单位是**秒**。其中 `[Sxx]` 是**可选**的：用「带时间戳，不带说话人」预设时模型只给 `[0.48]正文[1.66]`，解析器照样能切段，此时字幕里不会出现 `[Sxx]` 前缀（VTT 也不会有 `<v ...>`）。解析器对漏结尾时间戳、时间倒退做保守处理（丢弃/夹到上一段终点），不会生成非法 SRT。
-5. **进度与中断**。用 `streamer` 统计生成 token 驱动 ComfyUI 进度条，并在每次回调检查中断标志，点「取消」能立刻停。
+## 轨道结构
 
-## 实测（本机 RTX 3090 24 GB，`sdpa`，bf16）
+新项目默认三条轨道（上 → 下）：
 
-| 项 | 结果 |
-|---|---|
-| 中文语音 13.1 s（44.1 kHz 立体声→16 kHz 单声道） | 5 段、说话人正确、耗时 **3.9 s** |
-| 峰值显存（仅权重） | **1.74 GiB** |
-| 输出 | 合法 SRT（`00:00:00,410 --> 00:00:02,210`）与 JSON |
+1. **文字 / 特效**：只能放文字（贴纸等叠加轨道同属这一层）
+2. **主视频**（主轨）：只能放视频/图片与转场，位置固定
+3. **音频**：只能放音频与音效
 
-已在 ComfyUI 0.42.5 / Python 3.13.12 / torch 2.12.1+cu130 / transformers 5.20.2 上以
-`LoadAudio → MOSS 转写 → 保存字幕` 工作流端到端跑通。
+追加与排序规则（每次写入都会统一整理，不会穿插）：
 
-## 分发注意
+- 新视频轨道 → 主视频轨道正上方（副视频轨道紧贴主轨，文字轨道仍在最上层）
+- 新文字 / 贴纸轨道 → 最上层
+- 新音频轨道 → 最下层
+- 三条基础轨道（文字、主视频、音频）**不可删除**，删到只剩一条也不会发生
+- 旧项目打开时会自动补齐缺失的基础轨道（例如只有主轨的项目会补上文字轨与音频轨）
 
-权重有 1.7 GiB，**不适合直接 `git push`**（GitHub 单文件上限 100 MB）。三种做法：
+## 音频导出 / 合并
 
-1. 权重不进仓库，靠插件启动时自动下载 —— 开箱即用，推荐；
-2. 用 Git LFS 管理 `models/`；
-3. 打包成 zip 连同权重一起分发。
+- 选中音频片段后 **右键 →「导出音频」**：导出为 WAV
+  - 单段：直接导出，不加编号
+  - 多段：按时间轴从左到右分别导出，文件名自动编号 `01_…`、`02_…`
+- 选中多段音频后 **右键 →「合并选中的音频」**：合并成一段整体音频
+  - 只支持同一条音频轨道上的片段；保留相对位置与中间的空隙
+  - 合并结果是新的音频素材（`合并音频`），之后导出就是一个完整文件
+- 音频同样可以用「拆分」剪开，再合并回去
 
-另外 `models/MOSS-Transcribe-Diarize/` 里有 Hugging Face 的 `modeling_*.py` 等远端代码，
-加载时需要 `trust_remote_code=True`（插件已设好）。只放官方固定 revision 的文件。
+## 时间轴刻度
 
-## 限制
+- 默认缩放开在 **5 秒一格**（30 px/秒，标签间距 150 px），格内保留 1 秒细刻度
+- 放大 / 缩小会按像素间距自动切换刻度：帧级 → 1 秒 → 3 秒 → 5 秒 → 10 秒 → 30 秒…
+- 空时间轴或很短的工程也能缩到约 30 秒的可视范围（原来会被“适应宽度”卡在过细的刻度上）
 
-- **单次前向**，没有做 VAD 切片与分块拼接。24 GB 显存上 10 分钟音频约需 11–12 GB 显存（`sdpa`），可用；超过 30 分钟请先切片。
-- 时间戳是**句/段级**，不是词级。词级需要另外接 Whisper 对齐。
-- 静音、音乐、噪声上仍可能出现幻觉、提前结束或重复段落，重要结果需人工复核。
-- CPU 可以跑（fp32），但很慢。
+## 图标
 
-## 许可证与致谢
+同一张图只保留两种格式，各有不可替代的用途：
 
-- **模型权重**：版权归 OpenMOSS Team，Apache-2.0。本项目不是 OpenMOSS 官方发行物。
-- **实现来源参考**：[T8mars/Comfyui-MOSS-Transcribe-Diarize-T8](https://github.com/T8mars/Comfyui-MOSS-Transcribe-Diarize-T8)（Apache-2.0，作者 T8star-Aix）。本项目未复制其代码，但模型固定 revision、必需文件清单与 `processor` 调用方式参考了该项目的公开实现，特此致谢。
-- **本项目代码**：Apache-2.0。
+- `assets/logo.svg` → 界面 logo、`<link rel="icon">`、OG 图（矢量，任意尺寸清晰）
+- `assets/favicon.ico` → 一个文件内含 16/32/48/64，供老式标签页/书签兜底
+
+构建时只复制这两份到前端，`manifest.json` 也只引用 SVG；不再生成 `/icon.svg` 副本和 android/apple/ms 等 PNG 尺寸。
+
+## 语音转字幕
+
+字幕转录只有一个方法：**本机 MOSS-Transcribe-Diarize 模型**（原来的 Whisper
+Small / Large v3 Turbo / Distil Small 三个浏览器模型已全部删除）。
+
+- 前端只做音频准备：把片段解码成 16 kHz 单声道 Float32，每 5 分钟一块 POST 到
+  `/yuancut/transcribe`，再把返回的句段画成字幕
+- 后端（`yuancut_transcribe.py`）在本机调用 MOSS 推理，一次拿到「说话人 + 起止时间 + 文本」，
+  不需要浏览器下载权重，也不依赖 WebGPU/WASM
+- 权重放在 **`ComfyUI/models/Yuan_Cut/MOSS-Transcribe-Diarize/`**（约 1.8 GB）；
+  节点包 `custom_nodes/ComfyUI-Moss-Diarize-Yuan/models/MOSS-Transcribe-Diarize`
+  现在是指向该目录的软链接，MOSS 节点和字幕转录共用同一份权重
+- 引擎来自 `custom_nodes` 下的 MOSS 节点包（`moss_engine.py`），只借用它的推理代码，
+  不注册任何 ComfyUI 节点；找不到 Yuan_Cut 权重时回退到节点包自带目录
+- `GET /yuancut/transcribe` 返回引擎状态（是否找到模型包、权重是否就绪），便于排查
+- 模型首次转写时载入并常驻显存（BF16 + SDPA），之后重复转写不再重新加载
+- 单次请求上限 5 分钟音频，长素材由前端自动分块并拼接时间轴；后端最多接受 1 小时
+- 改了 `yuancut_transcribe.py` 或新增路由后需要重启 ComfyUI；只换前端静态文件不用重启
+
+## 音频标签（音效 / 提取音频）
+
+左侧面板在「媒体」和「文字」之间多了一个 **音频** 标签，样式与「媒体」一致
+（同一套卡片网格、图标按钮、拖拽与滚动条），离线可用，不需要任何服务端接口：
+- 卡片和「媒体」面板是**同一套组件**：直接复用 `media.tsx` 里的 `GridView` + `MediaPreview`
+  （同一份缩略图/占位图、时长角标、右键菜单、拖拽与选中样式），音频面板不再各写一套
+- **添加音频 / 音效**：左上角音乐图标按钮，选本地音频文件（`audio/*`），
+  走与「媒体」相同的导入管线，导入后以同样的卡片出现在音频面板
+- **从视频提取音频**：左上角摄影机图标按钮，选本地视频文件（`video/*`），
+  用 mediabunny 抽出音轨，转成 `原名.wav` 存进音频面板（不转码整个视频，只取音频轨）
+- **播放与媒体一致**：点卡片 = 选中，右侧**播放框**用同一个播放器播放，带原生进度条；
+  再点一次取消选中。拖动进度条、暂停/继续都在播放框里完成
+- 面板也支持把音频/视频直接拖进来：音频按普通素材导入，视频自动走提取流程
+- 卡片可以拖到时间轴，也可点「＋」按播放头插入；拖拽素材到时间轴时与「媒体」行为一致
+- 全部在浏览器本地完成，文件不上传；提取失败会逐个文件提示，不影响其它文件
+
+### 媒体与音频是两套独立的素材库
+
+- 素材带一个归属标记（`panel`）：`media` 属于媒体面板，`audio` 属于音频面板
+- **媒体面板只显示 media**：即使往媒体里拖音频，它也只留在媒体里，不会出现在音频面板
+- **音频面板只显示 audio**：音频面板导入或提取的素材，也不会跑到媒体面板
+- 归属标记随素材一起存进 IndexedDB/OPFS，刷新或重开项目都保持分开
+- 本次升级前已存在的素材没有归属标记，按 `media` 处理（会显示在媒体面板）；
+  需要出现在音频面板的旧音频，重新导入一次即可
+
+## 素材框选与删除
+
+- 「媒体」和「音频」面板都支持**框选**：在空白处按住左键拖出选框，与选框相交的素材会被选中，
+  卡片显示选中描边；面板**右下角**显示「已选 N 项」
+- **只有一套右键菜单**（面板级），右键任意位置弹的都是它，菜单内容：删除 / 导出所选 / 取消选择；
+  三者都作用于**当前选中集合**，与右键点在哪张素材上无关
+- 右键一个还没被选中的素材时，会先把它并入选中；已经在选中集合里（框选多条）就保持整个多选不动
+- **左键选中也会进选中集合**：点一张卡片等于单选它，此时右键菜单的「删除 / 导出所选」和
+  键盘 **Delete / Backspace** 都直接作用于这一条；再点一次卡片取消选中
+- 选中后按键盘 **Delete / Backspace** 删除（监听在捕获阶段，不会被时间轴的快捷键吞掉）
+- 实现上，动作发生时直接读选中集合（`getState()`），不再用渲染时的快照，
+  所以框选后立刻右键也一定是删全部
+- 面板上不再有常驻的操作栏/按钮，选中数量只在右下角的小角标里显示
+- 点击空白处或切到别的标签页会清空选中，不会残留在别的面板
+- **删除素材不会破坏时间线**：时间轴上的片段保留原位置、时长和轨道，
+  只是标红显示「素材丢失」，方便你重新导入同名素材或自行调整
+- 素材丢失时的表现：预览不再渲染该片段（不会黑屏或报错），音频播放自动跳过该段，
+  导出的成片同样保持时间线节奏不变
+
+## 性能说明（进入 / 退出项目）
+
+- **预取**：插件返回项目列表 HTML 时注入 `<link rel="prefetch">`，把编辑器要用的
+  JS/CSS（约 3 MB）提前拉进浏览器缓存，第一次进入项目也不用现下载
+- **不整页重载**：弹层顶栏的「项目」改为 `postMessage` + 前端路由跳转
+  （前端 `components/providers/host-bridge.tsx`），不再重载整个 iframe
+- **素材并发**：项目素材从 IndexedDB 读取改为 4 路并发（原来是逐个串行），
+  素材多的项目进入明显更快
+- **加载提示**：首次打开或「重新加载」时显示「正在加载 YuanCut…」，
+  延迟 150 ms 出现，避免快速加载时闪烁
+- **退出项目不再等缩略图**：视频项目直接跳过（改在下次进入时后台生成），
+  其它项目最多等 200 ms；空项目（时长 0）立即返回
+
+本地实测（缓存命中、localhost）：打开面板 ≈40 ms、进入项目 ≈40 ms、
+站内「项目」跳转 ≈30 ms、退出项目 ≈50–80 ms，无长任务（long task）。
+首次冷启动受机器磁盘/ComfyUI 自身负载影响，会看到加载提示。
+
+## 许可
+
+插件代码：MIT。内置前端来自一个 MIT 许可的开源视频编辑器，原始版权与许可声明
+保留在 [LICENSE](LICENSE)，分发时请一并保留。
