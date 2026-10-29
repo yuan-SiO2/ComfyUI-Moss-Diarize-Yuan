@@ -17,6 +17,7 @@ import asyncio
 import logging
 import re
 import shutil
+import subprocess
 import tempfile
 import uuid
 from pathlib import Path
@@ -107,6 +108,81 @@ def _num(value, default: float = 0.0) -> float:
         return default
 
 
+def _element_rate(element: dict) -> float:
+    """读取元素的播放倍速（前端字段名兼容 playbackRate / rate / speed）。"""
+    for key in ("playbackRate", "rate", "speed"):
+        if key in element:
+            rate = _num(element.get(key), 1.0)
+            if rate > 0:
+                return max(0.1, min(10.0, rate))
+    return 1.0
+
+
+def _element_keeps_pitch(element: dict) -> bool:
+    """默认保音高；显式 false 时走"磁带效果"（音高随速度变）。"""
+    value = element.get("preservesPitch")
+    return True if value is None else bool(value)
+
+
+_FILTER_AVAILABILITY: dict[str, bool] = {}
+
+
+def _has_filter(name: str) -> bool:
+    """缓存探测 ffmpeg 是否带某个滤镜（rubberband 是可选编译项）。"""
+    cached = _FILTER_AVAILABILITY.get(name)
+    if cached is not None:
+        return cached
+
+    available = False
+    ffmpeg = _ffmpeg_binary()
+    if ffmpeg:
+        try:
+            probe = subprocess.run(
+                [ffmpeg, "-hide_banner", "-filters"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            available = (
+                re.search(rf"^\s*\S+\s+{re.escape(name)}\s", probe.stdout or "", re.M)
+                is not None
+            )
+        except Exception:  # pragma: no cover - ffmpeg 不可用时退回 atempo
+            available = False
+    _FILTER_AVAILABILITY[name] = available
+    return available
+
+
+def _audio_tempo_filter(rate: float, *, keep_pitch: bool) -> str:
+    """音频变速滤镜链。
+
+    优先 rubberband（时间伸缩质量最好，且能同时控音高）；没有就退回 atempo
+    串联（ffmpeg 内置，单级只支持 0.5~2.0）。两者都不会像 asetrate/重采样那样
+    把音色拉尖变闷，这是"变速不变调"的关键。
+    """
+    if abs(rate - 1.0) < 1e-3:
+        return ""
+
+    if _has_filter("rubberband"):
+        pitch = 1.0 if keep_pitch else rate
+        return (
+            f"rubberband=tempo={rate:.6f}:pitch={pitch:.6f}"
+            f":formant={'preserved' if keep_pitch else 'shifted'}"
+        )
+
+    # 没有 rubberband：只能保音高（atempo 不支持变调），显式变调需求降级处理
+    chain: list[str] = []
+    value = rate
+    while value > 2.0:
+        chain.append("atempo=2.0")
+        value /= 2.0
+    while value < 0.5:
+        chain.append("atempo=0.5")
+        value /= 0.5
+    chain.append(f"atempo={value:.6f}")
+    return ",".join(chain)
+
+
 # --------------------------------------------------------------- filter 编译
 class CompileError(Exception):
     pass
@@ -181,9 +257,18 @@ def _build_filter(
             pos_y = _num(element.get("y"))
 
             label = f"v{index}"
+            # 变速：先按 length*rate 取源，再用 setpts 压回 length 秒
+            rate = _element_rate(element) if kind == "video" else 1.0
+            source_length = length * rate if rate != 1.0 else length
+            if rate != 1.0:
+                timing = (
+                    f"setpts=(PTS-STARTPTS)/{rate:.6f}+{start:.3f}/TB,fps={fps}"
+                )
+            else:
+                timing = f"setpts=PTS-STARTPTS+{start:.3f}/TB"
             parts.append(
-                f"[{stream}:v]trim=start={trim_start:.3f}:duration={length:.3f},"
-                f"setpts=PTS-STARTPTS+{start:.3f}/TB,"
+                f"[{stream}:v]trim=start={trim_start:.3f}:duration={source_length:.3f},"
+                f"{timing},"
                 f"scale=iw*{scale:.4f}:ih*{scale:.4f},format=rgba,"
                 f"colorchannelmixer=aa={opacity:.3f}[{label}]"
             )
@@ -267,9 +352,17 @@ def _build_filter(
             if length <= 0:
                 continue
             label = f"a{audio_index}"
+            # 变速：源取 length*rate 秒再时间伸缩回 length 秒；默认保音高（不变调）
+            rate = _element_rate(element)
+            source_length = length * rate if rate != 1.0 else length
+            tempo = _audio_tempo_filter(
+                rate, keep_pitch=_element_keeps_pitch(element)
+            )
             parts.append(
-                f"[{stream}:a]atrim=start={trim_start:.3f}:duration={length:.3f},"
-                f"asetpts=PTS-STARTPTS,volume={volume:.3f},"
+                f"[{stream}:a]atrim=start={trim_start:.3f}:duration={source_length:.3f},"
+                f"asetpts=PTS-STARTPTS,"
+                f"{tempo + ',' if tempo else ''}"
+                f"volume={volume:.3f},"
                 f"adelay={int(start * 1000)}|{int(start * 1000)}[{label}]"
             )
             audio_labels.append(f"[{label}]")

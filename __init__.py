@@ -215,6 +215,11 @@ try:
     yuancut_render.register_routes(_routes)
 
     # 字幕转录：统一走本地 MOSS-Transcribe-Diarize 模型（原先浏览器内的 Whisper 模型已下线）
+
+    # 人声美化：神经网络离线增强 + DSP 增强链（独立 venv，不污染 ComfyUI 环境）
+    from . import yuancut_voice
+
+    yuancut_voice.register_routes(_routes)
     from . import yuancut_transcribe
 
     yuancut_transcribe.register_routes(_routes)

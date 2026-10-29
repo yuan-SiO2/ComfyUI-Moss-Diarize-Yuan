@@ -117,6 +117,31 @@ tools/build_ui.sh /path/to/webapp-source
   - 合并结果是新的音频素材（`合并音频`），之后导出就是一个完整文件
 - 音频同样可以用「拆分」剪开，再合并回去
 
+
+## 人声美化（去混响 / 去喷麦 / 降噪 / 提升清晰度）
+
+选中**本地音频片段** → 右侧属性面板「人声美化」→ 拉强度 → 点应用。
+
+- 一次处理生成新素材 `<原名>-人声美化.wav`，片段自动切到它上面：**预览播的和导出用的是同一个文件**
+- 处理流程：MossFormer2_SE_48K（48 kHz 语音增强，CPU 推理 ≈ 0.12 倍实时）
+  → DSP 增强链（80 Hz 高通 / 250 Hz 去浑浊 / 3 kHz 存在感 / 4.5–8 kHz 去齿音 / 软门限 / 压缩 / 限制）
+  → 按「强度」与原声干湿混合 → 整段响度归一到语音 −20 dBFS、峰值 ≤ −1 dBFS
+- 时长与原素材严格一致，位置/裁剪/变速都不用改
+- 改强度重做：再点一次「重新处理」即可，原始素材一直留着（`voiceBeautifySourceId`）
+
+运行环境（只装一次，**独立 venv**，不影响 ComfyUI 主环境）：
+
+```bash
+tools/voice/setup_env.sh
+```
+
+会建 `~/.local/share/yuancut/voice/venv`（torch CPU + clearvoice）并从 ModelScope 拉
+`MossFormer2_SE_48K` 权重（约 211 MB）。设置 `YUANCUT_VOICE_ROOT` 可换目录。
+
+内存与安全：音频按 20 秒分块、重叠 1 秒交叉淡化流式处理，**内存占用与素材长度无关**
+（实测 4 分钟素材峰值约 0.9 GB）；worker 自身还加了 6 GB 地址空间上限，并尽量通过
+`systemd-run --user --scope` 跑在独立 cgroup 里——即使它失控，也只会杀它自己，
+不会再连带把 ComfyUI 一起 OOM 掉。
 ## 时间轴刻度
 
 - 默认缩放开在 **5 秒一格**（30 px/秒，标签间距 150 px），格内保留 1 秒细刻度
