@@ -6620,4 +6620,384 @@ patch(
 \t\t}''',
 )
 
+# --------------------------------------------------- 变速：预设按钮 -> 滑条
+# 上游把「Playback Speed」做成一排 0.25x/0.5x/... 按钮，再加一个独立的
+# 「Custom」数字输入框。YuanCut 里改成和缩放/旋转/透明度一样的排版：
+# 一行「标签 + 滑条 + 数字输入框」（0.25~4.0，step 0.05）。
+SPEED_GROUP_RE = (
+    r'^([ \t]*)<PropertyItem direction="column">\s*'
+    r'<PropertyItemLabel>\{t\("Playback Speed"\)\}</PropertyItemLabel>\s*'
+    r'<PropertyItemValue>\s*'
+    r'<div className="flex flex-wrap gap-1\.5">.*?</div>\s*'
+    r'</PropertyItemValue>\s*'
+    r'</PropertyItem>\s*'
+    r'<PropertyItem>\s*'
+    r'<PropertyItemLabel>\{t\("Custom"\)\}</PropertyItemLabel>\s*'
+    r'<PropertyItemValue>\s*'
+    r'(<div className="flex items-center gap-1">\s*<Input\b.*?/>.*?</div>)\s*'
+    r'</PropertyItemValue>\s*'
+    r'</PropertyItem>'
+)
+
+
+def _indent_lines(block: str, indent: str) -> list[str]:
+    """按相对缩进重排 JSX 片段：首行作为基准，其余行保留原有的层级。"""
+    lines = [line for line in block.splitlines() if line.strip()]
+    if not lines:
+        return []
+    head, rest = lines[0], lines[1:]
+    if rest:
+        common = min(len(line) - len(line.lstrip()) for line in rest)
+        rest = [
+            line[common:] if len(line) - len(line.lstrip()) >= common else line.strip()
+            for line in rest
+        ]
+    return [indent + head.strip()] + [indent + line for line in rest]
+
+
+def build_speed_row(match: re.Match[str]) -> str:
+    """把两个 PropertyItem 合成与缩放/旋转一致的单行滑条。"""
+    indent = match.group(1)
+    input_match = re.search(r"<Input\b.*?/>", match.group(2), re.S)
+    if input_match is None:
+        raise SystemExit("speed number input not found")
+    # 和缩放/旋转的数字框同宽（w-14），不要独占一行的 w-full
+    number_input = input_match.group(0).replace("h-7 w-full", "h-7 w-14")
+
+    row = [
+        '<PropertyItem direction="column">',
+        '\t<PropertyItemLabel>{t("Playback Speed")}</PropertyItemLabel>',
+        "\t<PropertyItemValue>",
+        '\t\t<div className="flex items-center gap-2">',
+        "\t\t\t<Slider",
+        "\t\t\t\tvalue={[currentSpeed]}",
+        "\t\t\t\tmin={0.25}",
+        "\t\t\t\tmax={4}",
+        "\t\t\t\tstep={0.05}",
+        '\t\t\t\tclassName="w-full"',
+        "\t\t\t\tonValueChange={([value]) => {",
+        "\t\t\t\t\tapplySpeedChange({",
+        "\t\t\t\t\t\tnewRate: Math.round(value * 100) / 100,",
+        "\t\t\t\t\t\tpushHistory: false,",
+        "\t\t\t\t\t});",
+        "\t\t\t\t}}",
+        "\t\t\t\tonValueCommit={([value]) => {",
+        "\t\t\t\t\tapplySpeedChange({",
+        "\t\t\t\t\t\tnewRate: Math.round(value * 100) / 100,",
+        "\t\t\t\t\t\tpushHistory: true,",
+        "\t\t\t\t\t});",
+        "\t\t\t\t}}",
+        "\t\t\t/>",
+    ]
+    row.extend(_indent_lines(number_input, "\t\t\t"))
+    row.extend(
+        [
+            "\t\t</div>",
+            "\t</PropertyItemValue>",
+            "</PropertyItem>",
+        ]
+    )
+    return "\n".join(indent + line if line else indent for line in row)
+
+
+def patch_speed_slider(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    if "value={[currentSpeed]}" in text:
+        print(f"  keep    {path.relative_to(ROOT)} (speed slider row)")
+        return
+
+    text2, count = re.subn(SPEED_GROUP_RE, build_speed_row, text, flags=re.S | re.M)
+    if count == 0:
+        raise SystemExit(f"speed preset block not found in {path}")
+    if count != 1:
+        raise SystemExit(f"{path}: expected 1 speed block, got {count}")
+    path.write_text(text2, encoding="utf-8")
+    print(f"  patched {path.relative_to(ROOT)} (speed slider row)")
+
+
+for _panel in ("audio-properties.tsx", "video-properties.tsx"):
+    _panel_path = SRC / "components" / "editor" / "panels" / "properties" / _panel
+    patch_speed_slider(_panel_path)
+    # SPEED_PRESETS 不再使用，去掉导入避免 lint 噪声
+    patch(
+        _panel_path,
+        'import { SPEED_PRESETS, formatSpeedLabel } from "@/lib/timeline/speed-utils";',
+        'import { formatSpeedLabel } from "@/lib/timeline/speed-utils";',
+        required=False,
+    )
+
 print("Done. Next: pnpm install && pnpm exec next build (see tools/build_ui.sh)")
+
+
+# ------------------------------------------------------------ 人声美化面板
+TIMELINE_TYPES = SRC / "types" / "timeline.ts"
+_tt = TIMELINE_TYPES.read_text(encoding="utf-8")
+if "voiceBeautifySourceId" not in _tt:
+    _tt = _tt.replace(
+        'export interface UploadAudioElement extends BaseAudioElement {\n\tsourceType: "upload";\n\tmediaId: string;\n}',
+        'export interface UploadAudioElement extends BaseAudioElement {\n'
+        '\tsourceType: "upload";\n'
+        '\tmediaId: string;\n'
+        '\t/** 人声美化：被处理的原始素材 id（留着以便重新处理） */\n'
+        '\tvoiceBeautifySourceId?: string;\n'
+        '\t/** 人声美化：上次使用的强度 0~1 */\n'
+        '\tvoiceBeautifyStrength?: number;\n'
+        '}',
+        1,
+    )
+    TIMELINE_TYPES.write_text(_tt, encoding="utf-8")
+    print(f"  patched {TIMELINE_TYPES.relative_to(ROOT)} (人声美化字段)")
+
+
+VOCAL_LIB = SRC / "lib" / "audio" / "vocal-beautify.ts"
+VOCAL_LIB_SOURCE = '''import { withBasePath } from "@/lib/base-path";
+import { uploadAssetBlob } from "@/lib/export";
+import type { EditorCore } from "@/core";
+import type { UploadAudioElement } from "@/types/timeline";
+
+export type VocalBeautifyProgress = {
+\tstatus: string;
+\tstage: string;
+\tprogress: number;
+\terror: string;
+};
+
+const STAGE_LABELS: Record<string, string> = {
+\tqueued: "排队中",
+\tstarting: "启动引擎",
+\tdecoding: "解码音频",
+\tloading: "载入模型",
+\tenhancing: "神经网络增强",
+\tdsp: "音色塑形",
+\tmixing: "合成输出",
+\tdone: "完成",
+};
+
+export function describeVocalBeautify(state: VocalBeautifyProgress): string {
+\tif (state.status === "done") return "处理完成";
+\tconst label = STAGE_LABELS[state.stage] ?? state.stage ?? "";
+\tconst percent = Math.round((state.progress ?? 0) * 100);
+\treturn percent > 0 ? `${label} ${percent}%` : label;
+}
+
+async function readDuration(buffer: ArrayBuffer): Promise<number | null> {
+\ttry {
+\t\tconst context = new AudioContext();
+\t\tconst decoded = await context.decodeAudioData(buffer.slice(0));
+\t\tconst duration = decoded.duration;
+\t\tvoid context.close();
+\t\treturn Number.isFinite(duration) ? duration : null;
+\t} catch {
+\t\treturn null;
+\t}
+}
+
+function extensionOf(name: string): string {
+\tconst match = /\\.([A-Za-z0-9]{2,5})$/.exec(name);
+\treturn (match?.[1] ?? "wav").toLowerCase();
+}
+
+/**
+ * 人声美化：原素材 → 服务端（MossFormer2_SE_48K + DSP 增强链）→ 新音频素材。
+ *
+ * 结果作为独立素材返回，调用方把片段切到它上面：预览播的是这个 wav，
+ * 导出时上传的也是这个 wav，所以预览和导出天然一致。
+ */
+export async function applyVocalBeautify({
+\teditor,
+\telement,
+\tstrength,
+\tonProgress,
+}: {
+\teditor: EditorCore;
+\telement: UploadAudioElement;
+\tstrength: number;
+\tonProgress?: (state: VocalBeautifyProgress) => void;
+}): Promise<{ mediaId: string; name: string }> {
+\tconst sourceMediaId = element.voiceBeautifySourceId ?? element.mediaId;
+\tconst source = editor.media.getAssets().find((asset) => asset.id === sourceMediaId);
+\tif (!source) throw new Error("找不到原始音频素材");
+
+\tconst uploaded = await uploadAssetBlob({
+\t\tassetId: source.id,
+\t\tblob: source.file,
+\t\text: extensionOf(source.name),
+\t});
+\tif (!uploaded) throw new Error("素材上传到服务端失败");
+
+\tconst started = await fetch(withBasePath("/api/voice/beautify"), {
+\t\tmethod: "POST",
+\t\theaders: { "Content-Type": "application/json" },
+\t\tbody: JSON.stringify({ assetId: source.id, strength }),
+\t});
+\tif (!started.ok) {
+\t\tconst detail = (await started.json().catch(() => ({}))) as { error?: string };
+\t\tthrow new Error(detail.error || `服务端拒绝（${started.status}）`);
+\t}
+\tconst { jobId } = (await started.json()) as { jobId?: string };
+\tif (!jobId) throw new Error("服务端没有返回任务号");
+
+\tlet state: VocalBeautifyProgress = {
+\t\tstatus: "queued",
+\t\tstage: "queued",
+\t\tprogress: 0,
+\t\terror: "",
+\t};
+\tfor (let attempt = 0; attempt < 3600; attempt += 1) {
+\t\tawait new Promise((resolve) => setTimeout(resolve, 500));
+\t\tconst response = await fetch(
+\t\t\twithBasePath(`/api/voice/progress?jobId=${encodeURIComponent(jobId)}`),
+\t\t);
+\t\tif (!response.ok) throw new Error(`进度查询失败（${response.status}）`);
+\t\tstate = (await response.json()) as VocalBeautifyProgress;
+\t\tonProgress?.(state);
+\t\tif (state.status === "done" || state.status === "error") break;
+\t}
+\tif (state.status === "error") throw new Error(state.error || "处理失败");
+\tif (state.status !== "done") throw new Error("处理超时");
+
+\tconst result = await fetch(withBasePath(`/api/voice/result?jobId=${encodeURIComponent(jobId)}`));
+\tif (!result.ok) throw new Error(`取回结果失败（${result.status}）`);
+\tconst buffer = await result.arrayBuffer();
+
+\tconst baseName = source.name.replace(/\\.[^.]+$/, "");
+\tconst name = `${baseName}-人声美化.wav`;
+\tconst file = new File([buffer], name, { type: "audio/wav" });
+\tconst url = URL.createObjectURL(file);
+\tconst duration = await readDuration(buffer);
+\tconst projectId = editor.project.getActive().metadata.id;
+\tconst mediaId = await editor.media.addMediaAsset({
+\t\tprojectId,
+\t\tasset: {
+\t\t\tname,
+\t\t\ttype: "audio",
+\t\t\tfile,
+\t\t\turl,
+\t\t\tduration: duration ?? source.duration,
+\t\t\tephemeral: true,
+\t\t},
+\t});
+
+\treturn { mediaId, name };
+}
+'''
+VOCAL_LIB.parent.mkdir(parents=True, exist_ok=True)
+VOCAL_LIB.write_text(VOCAL_LIB_SOURCE, encoding="utf-8")
+print(f"  wrote {VOCAL_LIB.relative_to(ROOT)} (人声美化客户端)")
+
+
+VOCAL_PANEL = SRC / "components" / "editor" / "panels" / "properties" / "audio-properties.tsx"
+_panel = VOCAL_PANEL.read_text(encoding="utf-8")
+
+VOCAL_HANDLER = '''\tconst runVocalBeautify = async () => {
+\t\tif (element.sourceType !== "upload" || beautifyBusy) return;
+\t\tconst upload = element as UploadAudioElement;
+\t\tsetBeautifyBusy(true);
+\t\tsetBeautifyStatus("准备中…");
+\t\ttry {
+\t\t\tconst result = await applyVocalBeautify({
+\t\t\t\teditor,
+\t\t\t\telement: upload,
+\t\t\t\tstrength: beautifyStrength,
+\t\t\t\tonProgress: (state) => setBeautifyStatus(describeVocalBeautify(state)),
+\t\t\t});
+\t\t\tupdateElement({
+\t\t\t\tupdates: {
+\t\t\t\t\tmediaId: result.mediaId,
+\t\t\t\t\tname: result.name,
+\t\t\t\t\tvoiceBeautifySourceId: upload.voiceBeautifySourceId ?? upload.mediaId,
+\t\t\t\t\tvoiceBeautifyStrength: beautifyStrength,
+\t\t\t\t},
+\t\t\t});
+\t\t\tsetBeautifyStatus("已应用：预览与导出都用处理后的音频");
+\t\t} catch (error) {
+\t\t\tsetBeautifyStatus(`失败：${(error as Error).message}`);
+\t\t} finally {
+\t\t\tsetBeautifyBusy(false);
+\t\t}
+\t};
+
+'''
+
+VOCAL_CARD = '''\t\t\t\t<PropertyGroup title="人声美化" collapsible={false}>
+\t\t\t\t\t{element.sourceType === "upload" ? (
+\t\t\t\t\t\t<div className="flex flex-col gap-2">
+\t\t\t\t\t\t\t<PropertyItem direction="column">
+\t\t\t\t\t\t\t\t<PropertyItemLabel>强度</PropertyItemLabel>
+\t\t\t\t\t\t\t\t<PropertyItemValue>
+\t\t\t\t\t\t\t\t\t<div className="flex items-center gap-2">
+\t\t\t\t\t\t\t\t\t\t<Slider
+\t\t\t\t\t\t\t\t\t\t\tvalue={[Math.round(beautifyStrength * 100)]}
+\t\t\t\t\t\t\t\t\t\t\tonValueChange={([value]) =>
+\t\t\t\t\t\t\t\t\t\t\t\tsetBeautifyStrength(
+\t\t\t\t\t\t\t\t\t\t\t\t\tclamp({ value: value ?? 80, min: 0, max: 100 }) / 100,
+\t\t\t\t\t\t\t\t\t\t\t\t)
+\t\t\t\t\t\t\t\t\t\t\t}
+\t\t\t\t\t\t\t\t\t\t\tclassName="flex-1"
+\t\t\t\t\t\t\t\t\t\t\tdisabled={beautifyBusy}
+\t\t\t\t\t\t\t\t\t\t/>
+\t\t\t\t\t\t\t\t\t\t<span className="text-muted-foreground w-10 text-right text-xs">
+\t\t\t\t\t\t\t\t\t\t\t{Math.round(beautifyStrength * 100)}%
+\t\t\t\t\t\t\t\t\t\t</span>
+\t\t\t\t\t\t\t\t\t</div>
+\t\t\t\t\t\t\t\t</PropertyItemValue>
+\t\t\t\t\t\t\t</PropertyItem>
+\t\t\t\t\t\t\t<button
+\t\t\t\t\t\t\t\ttype="button"
+\t\t\t\t\t\t\t\tdisabled={beautifyBusy}
+\t\t\t\t\t\t\t\tonClick={() => {
+\t\t\t\t\t\t\t\t\tvoid runVocalBeautify();
+\t\t\t\t\t\t\t\t}}
+\t\t\t\t\t\t\t\tclassName="bg-accent hover:bg-accent/80 h-7 w-full rounded-sm px-2 text-xs disabled:opacity-50"
+\t\t\t\t\t\t\t>
+\t\t\t\t\t\t\t\t{beautifyBusy
+\t\t\t\t\t\t\t\t\t? "处理中…"
+\t\t\t\t\t\t\t\t\t: (element as UploadAudioElement).voiceBeautifySourceId
+\t\t\t\t\t\t\t\t\t\t? "重新处理"
+\t\t\t\t\t\t\t\t\t\t: "应用人声美化"}
+\t\t\t\t\t\t\t</button>
+\t\t\t\t\t\t\t<span className="text-muted-foreground text-[11px] leading-tight">
+\t\t\t\t\t\t\t\t{beautifyStatus || "去混响 / 去喷麦 / 降噪 / 提升清晰度"}
+\t\t\t\t\t\t\t</span>
+\t\t\t\t\t\t</div>
+\t\t\t\t\t) : (
+\t\t\t\t\t\t<span className="text-muted-foreground text-[11px]">仅支持本地音频素材</span>
+\t\t\t\t\t)}
+\t\t\t\t</PropertyGroup>
+
+'''
+
+if "applyVocalBeautify" not in _panel:
+    _panel = _panel.replace(
+        'import type { AudioElement } from "@/types/timeline";',
+        'import type { AudioElement, UploadAudioElement } from "@/types/timeline";\n'
+        'import {\n\tapplyVocalBeautify,\n\tdescribeVocalBeautify,\n} from "@/lib/audio/vocal-beautify";',
+        1,
+    )
+    _panel = _panel.replace(
+        'import { useReducer, useRef } from "react";',
+        'import { useReducer, useRef, useState } from "react";',
+        1,
+    )
+    _panel = _panel.replace(
+        "\tconst [, forceRender] = useReducer((x: number) => x + 1, 0);",
+        "\tconst [, forceRender] = useReducer((x: number) => x + 1, 0);\n"
+        "\tconst [beautifyBusy, setBeautifyBusy] = useState(false);\n"
+        "\tconst [beautifyStatus, setBeautifyStatus] = useState(\"\");\n"
+        "\tconst [beautifyStrength, setBeautifyStrength] = useState(\n"
+        "\t\t(element as UploadAudioElement).voiceBeautifyStrength ?? 0.8,\n"
+        "\t);\n",
+        1,
+    )
+    _panel = _panel.replace(
+        '\treturn (\n\t\t<div className="flex h-full flex-col">',
+        VOCAL_HANDLER + '\treturn (\n\t\t<div className="flex h-full flex-col">',
+        1,
+    )
+    _marker = "\t\t\t</PanelBaseView>"
+    _index = _panel.rfind(_marker)
+    if _index == -1:
+        raise SystemExit(f"panel view marker not found in {VOCAL_PANEL}")
+    _panel = _panel[:_index] + VOCAL_CARD + _panel[_index:]
+    VOCAL_PANEL.write_text(_panel, encoding="utf-8")
+    print(f"  patched {VOCAL_PANEL.relative_to(ROOT)} (人声美化卡片)")
