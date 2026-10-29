@@ -7001,3 +7001,82 @@ if "applyVocalBeautify" not in _panel:
     _panel = _panel[:_index] + VOCAL_CARD + _panel[_index:]
     VOCAL_PANEL.write_text(_panel, encoding="utf-8")
     print(f"  patched {VOCAL_PANEL.relative_to(ROOT)} (人声美化卡片)")
+
+
+# ---------------------------------------------------- 只保留中英文 / 去掉反馈
+# 上游把语言做成 URL 段（/[locale]/...），这里把 locale 收窄到 en/zh，
+# 并删掉其它语言的翻译包，静态导出就不会再生成那 10 套页面。
+_I18N_CONFIG = WEB / "src" / "i18n.config.ts"
+if _I18N_CONFIG.is_file():
+    _t = _I18N_CONFIG.read_text(encoding="utf-8")
+    _start = _t.find("locales: [")
+    if _start != -1:
+        _end = _t.index("]", _start) + 1
+        _t = _t[:_start] + 'locales: ["en", "zh"]' + _t[_end:]
+        _I18N_CONFIG.write_text(_t, encoding="utf-8")
+        print("  patched src/i18n.config.ts (locales -> en/zh)")
+
+_LANG_TOGGLE = WEB / "src" / "components" / "language-toggle.tsx"
+if _LANG_TOGGLE.is_file():
+    _t = _LANG_TOGGLE.read_text(encoding="utf-8")
+    _start = _t.find("const SUPPORTED_LANGUAGES = [")
+    if _start != -1:
+        _end = _t.index("] as const;", _start) + len("] as const;")
+        _replacement = (
+            "const SUPPORTED_LANGUAGES = [\n"
+            '\t{ code: "en", label: "English" },\n'
+            '\t{ code: "zh", label: "中文" },\n'
+            "] as const;"
+        )
+        _t = _t[:_start] + _replacement + _t[_end:]
+        _LANG_TOGGLE.write_text(_t, encoding="utf-8")
+        print("  patched src/components/language-toggle.tsx (语言列表只留中英)")
+
+_LOCALES_DIR = WEB / "public" / "locales"
+if _LOCALES_DIR.is_dir():
+    for _entry in sorted(_LOCALES_DIR.iterdir()):
+        if _entry.is_dir() and _entry.name not in ("en", "zh"):
+            shutil.rmtree(_entry)
+            print(f"  removed public/locales/{_entry.name}/")
+
+# 反馈：编辑器头部按钮、移动端菜单项，以及弹窗/服务本身
+for _rel in ("src/components/feedback", "src/services/feedback"):
+    _target = WEB / _rel
+    if _target.is_dir():
+        shutil.rmtree(_target)
+        print(f"  removed {_rel}/")
+
+_EDITOR_HEADER = WEB / "src" / "components" / "editor" / "editor-header.tsx"
+if _EDITOR_HEADER.is_file():
+    _t = _EDITOR_HEADER.read_text(encoding="utf-8")
+    if "FeedbackTrigger" in _t:
+        _t = _t.replace(
+            'import { FeedbackTrigger } from "@/components/feedback/feedback-trigger";\n', ""
+        )
+        _t = re.sub(r"[ \t]*<FeedbackTrigger>.*?</FeedbackTrigger>\n", "", _t, flags=re.S)
+        # 这个图标只服务于反馈按钮，一并删掉
+        _t = _t.replace("\tBubbleChatIcon,\n", "")
+        _EDITOR_HEADER.write_text(_t, encoding="utf-8")
+        print("  patched editor-header.tsx (去掉反馈按钮)")
+
+_MOBILE_HEADER = WEB / "src" / "components" / "editor" / "mobile" / "mobile-header.tsx"
+if _MOBILE_HEADER.is_file():
+    _t = _MOBILE_HEADER.read_text(encoding="utf-8")
+    if "FeedbackDialog" in _t:
+        _t = _t.replace(
+            'import { FeedbackDialog } from "@/components/feedback/feedback-dialog";\n', ""
+        )
+        _t = _t.replace("\tconst [feedbackOpen, setFeedbackOpen] = useState(false);\n", "")
+        _t = re.sub(r"\n\tconst handleFeedback = \(\) => \{.*?\n\t\};\n", "\n", _t, flags=re.S)
+        _t = re.sub(
+            r"\n[ \t]*<DropdownMenuItem[^>]*onClick=\{handleFeedback\}.*?</DropdownMenuItem>",
+            "",
+            _t,
+            flags=re.S,
+        )
+        _t = _t.replace(
+            "\n\t\t\t<FeedbackDialog open={feedbackOpen} onOpenChange={setFeedbackOpen} />", ""
+        )
+        _t = _t.replace("\tBubbleChatIcon,\n", "")
+        _MOBILE_HEADER.write_text(_t, encoding="utf-8")
+        print("  patched mobile-header.tsx (去掉反馈菜单项)")
