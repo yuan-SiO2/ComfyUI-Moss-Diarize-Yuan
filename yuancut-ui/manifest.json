@@ -1,1 +1,13 @@
-
+{
+  "name": "YuanCut",
+  "description": "A simple but powerful video editor that gets the job done. In your browser.",
+  "display": "standalone",
+  "start_url": "/",
+  "icons": [
+    {
+      "src": "/yuancut/logos/yuancut/svg/logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
