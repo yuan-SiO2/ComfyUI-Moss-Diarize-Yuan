@@ -1992,6 +1992,7 @@ if (ASSETS / "logo.svg").is_file():
 print("==> 导出健壮性 + 取帧提速")
 
 TAB = chr(9)
+NL = chr(10)
 
 
 def tabsify(block: str) -> str:
@@ -4022,13 +4023,14 @@ SUBTITLE_HELPERS = tabsify("""
 function padTime(value: number, size = 2): string {
   return String(Math.floor(value)).padStart(size, "0");
 }
-
 function formatSrtTime(seconds: number): string {
-  const total = Math.max(0, seconds);
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const secs = Math.floor(total % 60);
-  const millis = Math.round((total - Math.floor(total)) * 1000);
+  // 先四舍五入到毫秒再拆位，避免出现 ",1000" 这种越界毫秒（导入侧会解析成 1 秒，
+  // 但很多播放器会直接判为坏时间码）
+  const totalMs = Math.round(Math.max(0, seconds) * 1000);
+  const hours = Math.floor(totalMs / 3600000);
+  const minutes = Math.floor((totalMs % 3600000) / 60000);
+  const secs = Math.floor((totalMs % 60000) / 1000);
+  const millis = totalMs % 1000;
   return `${padTime(hours)}:${padTime(minutes)}:${padTime(secs)},${padTime(millis, 3)}`;
 }
 
@@ -4343,13 +4345,11 @@ import {
   getAvailableVideoCodecs,
   getCodecLabel,
   getExportFileExtension,
-  getExportMimeType,
   getExportResolutionLabel,
   getServerExportDir,
   saveBlobToServer,
   isExportResolution,
   isExportVideoCodec,
-  muxWithServer,
   resolveExportSize,
   uploadAssetBlob,
   saveExportBlob,
@@ -4361,7 +4361,6 @@ import {
   EXPORT_BITRATE_VALUES,
   EXPORT_FPS_VALUES,
   EXPORT_FORMAT_VALUES,
-  EXPORT_QUALITY_VALUES,
   EXPORT_RESOLUTION_VALUES,
   EXPORT_SUBTITLE_FORMAT_VALUES,
   type ExportAudioFormat,
@@ -4596,9 +4595,35 @@ async function renderTimelineOnServer({
             transform?: { position?: { x: number; y: number }; scale?: number };
           };
           if (visual.hidden) continue;
+          // 人声美化：视频换声音但不换画面 —— 画面这条静音，另加一条处理后的音频
+          const beautify = element as unknown as {
+            voiceBeautifyEnabled?: boolean;
+            voiceBeautifyMediaId?: string;
+            playbackRate?: number;
+          };
+          const beautifyMediaId =
+            beautify.voiceBeautifyEnabled && beautify.voiceBeautifyMediaId
+              ? beautify.voiceBeautifyMediaId
+              : "";
+          if (beautifyMediaId && !uploadedAssetIds.has(beautifyMediaId)) {
+            const beautyAsset = assets.find((item) => item.id === beautifyMediaId);
+            if (!beautyAsset?.file) {
+              throw new Error(`人声美化素材缺失：${beautifyMediaId}`);
+            }
+            const ok = await uploadAssetBlob({
+              assetId: beautifyMediaId,
+              blob: beautyAsset.file,
+              ext: guessAssetExtension(beautyAsset.file),
+            });
+            if (!ok) {
+              throw new Error(`素材上传失败：${beautyAsset.file.name}`);
+            }
+            uploadedAssetIds.add(beautifyMediaId);
+          }
           elements.push({
             type: element.type,
             assetId: mediaId,
+            muted: beautifyMediaId ? true : undefined,
             start,
             duration: length,
             trimStart: visual.trimStart ?? 0,
@@ -4607,6 +4632,17 @@ async function renderTimelineOnServer({
             y: Math.round(visual.transform?.position?.y ?? 0),
             opacity: visual.opacity ?? 1,
           });
+          if (beautifyMediaId) {
+            elements.push({
+              type: "audio",
+              assetId: beautifyMediaId,
+              start,
+              duration: length,
+              trimStart: visual.trimStart ?? 0,
+              volume: 1,
+              playbackRate: beautify.playbackRate ?? 1,
+            });
+          }
         } else if (element.type === "audio") {
           const audio = element as unknown as {
             hidden?: boolean;
@@ -6732,17 +6768,36 @@ print("Done. Next: pnpm install && pnpm exec next build (see tools/build_ui.sh)"
 # ------------------------------------------------------------ 人声美化面板
 TIMELINE_TYPES = SRC / "types" / "timeline.ts"
 _tt = TIMELINE_TYPES.read_text(encoding="utf-8")
-if "voiceBeautifySourceId" not in _tt:
+if "voiceBeautifyMediaId" not in _tt:
     _tt = _tt.replace(
         'export interface UploadAudioElement extends BaseAudioElement {\n\tsourceType: "upload";\n\tmediaId: string;\n}',
         'export interface UploadAudioElement extends BaseAudioElement {\n'
         '\tsourceType: "upload";\n'
         '\tmediaId: string;\n'
-        '\t/** 人声美化：被处理的原始素材 id（留着以便重新处理） */\n'
+        '\t/** 人声美化：勾选后用处理结果当音源，取消勾选切回原素材 */\n'
+        '\tvoiceBeautifyEnabled?: boolean;\n'
+        '\t/** 人声美化：处理结果（wav）素材 id */\n'
+        '\tvoiceBeautifyMediaId?: string;\n'
+        '\t/** 人声美化：被处理的原始素材 id（留着以便重新处理 / 还原） */\n'
         '\tvoiceBeautifySourceId?: string;\n'
+        '\t/** 人声美化：原始素材名称（取消勾选时还原） */\n'
+        '\tvoiceBeautifySourceName?: string;\n'
         '\t/** 人声美化：上次使用的强度 0~1 */\n'
         '\tvoiceBeautifyStrength?: number;\n'
         '}',
+        1,
+    )
+    _tt = _tt.replace(
+        '\tplaybackRate?: number;\n\treversed?: boolean;\n}\n\nexport interface ImageElement',
+        '\tplaybackRate?: number;\n'
+        '\treversed?: boolean;\n'
+        '\t/** 人声美化：勾选后用 voiceBeautifyMediaId 的声音替换画面自带音轨 */\n'
+        '\tvoiceBeautifyEnabled?: boolean;\n'
+        '\t/** 人声美化：处理结果（wav）素材 id */\n'
+        '\tvoiceBeautifyMediaId?: string;\n'
+        '\t/** 人声美化：上次使用的强度 0~1 */\n'
+        '\tvoiceBeautifyStrength?: number;\n'
+        '}\n\nexport interface ImageElement',
         1,
     )
     TIMELINE_TYPES.write_text(_tt, encoding="utf-8")
@@ -6753,7 +6808,7 @@ VOCAL_LIB = SRC / "lib" / "audio" / "vocal-beautify.ts"
 VOCAL_LIB_SOURCE = '''import { withBasePath } from "@/lib/base-path";
 import { uploadAssetBlob } from "@/lib/export";
 import type { EditorCore } from "@/core";
-import type { UploadAudioElement } from "@/types/timeline";
+import type { MediaAsset } from "@/types/assets";
 
 export type VocalBeautifyProgress = {
 \tstatus: string;
@@ -6800,23 +6855,22 @@ function extensionOf(name: string): string {
 /**
  * 人声美化：原素材 → 服务端（MossFormer2_SE_48K + DSP 增强链）→ 新音频素材。
  *
- * 结果作为独立素材返回，调用方把片段切到它上面：预览播的是这个 wav，
- * 导出时上传的也是这个 wav，所以预览和导出天然一致。
+ * 结果作为独立音频素材返回：音频片段把 mediaId 切过去，视频片段把结果挂到
+ * voiceBeautifyMediaId（画面不动、只换声音）。预览和导出用的都是这个 wav，
+ * 所以预览与导出天然一致。
  */
 export async function applyVocalBeautify({
 \teditor,
-\telement,
+\tsource,
 \tstrength,
 \tonProgress,
 }: {
 \teditor: EditorCore;
-\telement: UploadAudioElement;
+\t/** 原始素材：音频片段，或带音轨的视频片段 */
+\tsource: MediaAsset;
 \tstrength: number;
 \tonProgress?: (state: VocalBeautifyProgress) => void;
 }): Promise<{ mediaId: string; name: string }> {
-\tconst sourceMediaId = element.voiceBeautifySourceId ?? element.mediaId;
-\tconst source = editor.media.getAssets().find((asset) => asset.id === sourceMediaId);
-\tif (!source) throw new Error("找不到原始音频素材");
 
 \tconst uploaded = await uploadAssetBlob({
 \t\tassetId: source.id,
@@ -6886,84 +6940,255 @@ VOCAL_LIB.write_text(VOCAL_LIB_SOURCE, encoding="utf-8")
 print(f"  wrote {VOCAL_LIB.relative_to(ROOT)} (人声美化客户端)")
 
 
-VOCAL_PANEL = SRC / "components" / "editor" / "panels" / "properties" / "audio-properties.tsx"
+VOICE_PANEL_DIR = SRC / "components" / "editor" / "panels" / "properties"
+
+# 人声美化那一行：音频 / 视频属性面板共用，样式对齐音量、速度；
+# 前置勾选框，不勾就是灰的不可编辑，勾上才处理。
+VOCAL_ROW = VOICE_PANEL_DIR / "vocal-beautify-row.tsx"
+VOCAL_ROW_SOURCE = '''"use client";
+
+import { Slider } from "@/components/ui/slider";
+import {
+\tPropertyGroup,
+\tPropertyItem,
+\tPropertyItemLabel,
+\tPropertyItemValue,
+} from "./property-item";
+
+export function VocalBeautifyRow({
+\tenabled,
+\tbusy,
+\tstrength,
+\tstatus,
+\tprogress,
+\tneedsApply,
+\tonToggle,
+\tonStrengthChange,
+\tonApply,
+}: {
+\t/** 勾选状态：点了立刻变，不等处理完 */
+\tenabled: boolean;
+\tbusy: boolean;
+\tstrength: number;
+\tstatus: string;
+\t/** 0~1 的处理进度，null 表示没在跑 */
+\tprogress: number | null;
+\tneedsApply: boolean;
+\tonToggle: (checked: boolean) => void;
+\tonStrengthChange: (value: number) => void;
+\tonApply: () => void;
+}) {
+\tconst percent = Math.round(strength * 100);
+\tconst done = Math.max(0, Math.min(1, progress ?? 0));
+\treturn (
+\t\t<PropertyGroup title="人声美化" collapsible={false}>
+\t\t\t<div className="space-y-2.5">
+\t\t\t\t<PropertyItem>
+\t\t\t\t\t<PropertyItemLabel>
+\t\t\t\t\t\t<label className="flex cursor-pointer items-center gap-1.5 select-none">
+\t\t\t\t\t\t\t<input
+\t\t\t\t\t\t\t\ttype="checkbox"
+\t\t\t\t\t\t\t\tclassName="accent-primary size-3.5 cursor-pointer"
+\t\t\t\t\t\t\t\tchecked={enabled}
+\t\t\t\t\t\t\t\tonChange={(event) => {
+\t\t\t\t\t\t\t\t\tonToggle(event.target.checked);
+\t\t\t\t\t\t\t\t}}
+\t\t\t\t\t\t\t/>
+\t\t\t\t\t\t\t启用
+\t\t\t\t\t\t</label>
+\t\t\t\t\t</PropertyItemLabel>
+\t\t\t\t\t<PropertyItemValue>
+\t\t\t\t\t\t<div
+\t\t\t\t\t\t\tclassName={
+\t\t\t\t\t\t\t\tenabled
+\t\t\t\t\t\t\t\t\t? "flex items-center gap-2"
+\t\t\t\t\t\t\t\t\t: "flex items-center gap-2 opacity-40"
+\t\t\t\t\t\t\t}
+\t\t\t\t\t\t>
+\t\t\t\t\t\t\t<Slider
+\t\t\t\t\t\t\t\tvalue={[percent]}
+\t\t\t\t\t\t\t\tmin={0}
+\t\t\t\t\t\t\t\tmax={100}
+\t\t\t\t\t\t\t\tstep={1}
+\t\t\t\t\t\t\t\tdisabled={!enabled || busy}
+\t\t\t\t\t\t\t\tonValueChange={([value]) => {
+\t\t\t\t\t\t\t\t\tonStrengthChange((value ?? 80) / 100);
+\t\t\t\t\t\t\t\t}}
+\t\t\t\t\t\t\t\tclassName="flex-1"
+\t\t\t\t\t\t\t/>
+\t\t\t\t\t\t\t<span className="text-muted-foreground w-9 text-right text-xs tabular-nums">
+\t\t\t\t\t\t\t\t{percent}%
+\t\t\t\t\t\t\t</span>
+\t\t\t\t\t\t</div>
+\t\t\t\t\t</PropertyItemValue>
+\t\t\t\t</PropertyItem>
+\t\t\t\t{busy ? (
+\t\t\t\t\t<div className="space-y-1">
+\t\t\t\t\t\t<div className="bg-accent h-1 w-full overflow-hidden rounded-full">
+\t\t\t\t\t\t\t<div
+\t\t\t\t\t\t\t\tclassName="bg-primary h-full rounded-full transition-[width] duration-300"
+\t\t\t\t\t\t\t\tstyle={{ width: `${Math.round(done * 100)}%` }}
+\t\t\t\t\t\t\t/>
+\t\t\t\t\t\t</div>
+\t\t\t\t\t\t<span className="text-foreground/80 block text-[11px] leading-tight">
+\t\t\t\t\t\t\t{status || "处理中…"}
+\t\t\t\t\t\t</span>
+\t\t\t\t\t</div>
+\t\t\t\t) : (
+\t\t\t\t\t<span className="text-muted-foreground block text-[11px] leading-tight">
+\t\t\t\t\t\t{enabled
+\t\t\t\t\t\t\t? status || "去混响 / 去喷麦 / 降噪 / 提升清晰度"
+\t\t\t\t\t\t\t: "不勾选保持原声"}
+\t\t\t\t\t</span>
+\t\t\t\t)}
+\t\t\t\t{enabled && needsApply && !busy ? (
+\t\t\t\t\t<button
+\t\t\t\t\t\ttype="button"
+\t\t\t\t\t\tonClick={onApply}
+\t\t\t\t\t\tclassName="bg-accent hover:bg-accent/80 h-7 w-full rounded-sm px-2 text-xs"
+\t\t\t\t\t>
+\t\t\t\t\t\t按新强度重新处理
+\t\t\t\t\t</button>
+\t\t\t\t) : null}
+\t\t\t</div>
+\t\t</PropertyGroup>
+\t);
+}
+'''
+VOCAL_ROW.parent.mkdir(parents=True, exist_ok=True)
+VOCAL_ROW.write_text(VOCAL_ROW_SOURCE, encoding="utf-8")
+print(f"  wrote {VOCAL_ROW.relative_to(ROOT)} (人声美化勾选行)")
+
+
+VOCAL_PANEL = VOICE_PANEL_DIR / "audio-properties.tsx"
 _panel = VOCAL_PANEL.read_text(encoding="utf-8")
 
-VOCAL_HANDLER = '''\tconst runVocalBeautify = async () => {
+VOCAL_HANDLER = '''\tconst beautifySourceId =
+\t\t(element as UploadAudioElement).voiceBeautifySourceId ??
+\t\t(element as UploadAudioElement).mediaId;
+\tconst beautifyStoredEnabled =
+\t\t(element as UploadAudioElement).voiceBeautifyEnabled ??
+\t\tBoolean((element as UploadAudioElement).voiceBeautifySourceId);
+\tconst beautifyAppliedStrength = (element as UploadAudioElement)
+\t\t.voiceBeautifyStrength;
+\t// 点击后先用本地状态把勾打上（不等处理完），等片段字段生效再交回去
+\tconst [beautifyOverride, setBeautifyOverride] = useState<boolean | null>(null);
+\tconst beautifyEnabled = beautifyOverride ?? beautifyStoredEnabled;
+\tconst [beautifyProgress, setBeautifyProgress] = useState<number | null>(null);
+
+\tuseEffect(() => {
+\t\tif (beautifyOverride !== null && beautifyOverride === beautifyStoredEnabled) {
+\t\t\tsetBeautifyOverride(null);
+\t\t}
+\t}, [beautifyOverride, beautifyStoredEnabled]);
+
+\tconst runVocalBeautify = async () => {
 \t\tif (element.sourceType !== "upload" || beautifyBusy) return;
 \t\tconst upload = element as UploadAudioElement;
+\t\tconst source = editor.media
+\t\t\t.getAssets()
+\t\t\t.find((asset) => asset.id === beautifySourceId);
+\t\tif (!source) {
+\t\t\tsetBeautifyOverride(null);
+\t\t\tsetBeautifyStatus("找不到原始素材");
+\t\t\treturn;
+\t\t}
 \t\tsetBeautifyBusy(true);
+\t\tsetBeautifyProgress(0);
 \t\tsetBeautifyStatus("准备中…");
 \t\ttry {
 \t\t\tconst result = await applyVocalBeautify({
 \t\t\t\teditor,
-\t\t\t\telement: upload,
+\t\t\t\tsource,
 \t\t\t\tstrength: beautifyStrength,
-\t\t\t\tonProgress: (state) => setBeautifyStatus(describeVocalBeautify(state)),
+\t\t\t\tonProgress: (state) => {
+\t\t\t\t\tsetBeautifyStatus(describeVocalBeautify(state));
+\t\t\t\t\tsetBeautifyProgress(state.progress ?? 0);
+\t\t\t\t},
 \t\t\t});
 \t\t\tupdateElement({
 \t\t\t\tupdates: {
 \t\t\t\t\tmediaId: result.mediaId,
 \t\t\t\t\tname: result.name,
-\t\t\t\t\tvoiceBeautifySourceId: upload.voiceBeautifySourceId ?? upload.mediaId,
+\t\t\t\t\tvoiceBeautifyEnabled: true,
+\t\t\t\t\tvoiceBeautifyMediaId: result.mediaId,
+\t\t\t\t\tvoiceBeautifySourceId: beautifySourceId,
+\t\t\t\t\tvoiceBeautifySourceName: upload.voiceBeautifySourceName ?? upload.name,
 \t\t\t\t\tvoiceBeautifyStrength: beautifyStrength,
 \t\t\t\t},
 \t\t\t});
-\t\t\tsetBeautifyStatus("已应用：预览与导出都用处理后的音频");
+\t\t\tsetBeautifyStatus("已处理：预览与导出都用处理后的音频");
 \t\t} catch (error) {
+\t\t\tsetBeautifyOverride(null);
 \t\t\tsetBeautifyStatus(`失败：${(error as Error).message}`);
 \t\t} finally {
 \t\t\tsetBeautifyBusy(false);
+\t\t\tsetBeautifyProgress(null);
 \t\t}
+\t};
+
+\tconst toggleVocalBeautify = (checked: boolean) => {
+\t\tif (element.sourceType !== "upload" || beautifyBusy) return;
+\t\tconst upload = element as UploadAudioElement;
+\t\tsetBeautifyOverride(checked);
+\t\tif (!checked) {
+\t\t\tupdateElement({
+\t\t\t\tupdates: {
+\t\t\t\t\tmediaId: beautifySourceId,
+\t\t\t\t\tname:
+\t\t\t\t\t\tupload.voiceBeautifySourceName ??
+\t\t\t\t\t\tupload.name.replace(/-人声美化(?=\\.|$)/, ""),
+\t\t\t\t\tvoiceBeautifyEnabled: false,
+\t\t\t\t},
+\t\t\t});
+\t\t\tsetBeautifyStatus("");
+\t\t\treturn;
+\t\t}
+\t\tif (upload.voiceBeautifyMediaId) {
+\t\t\tconst processed = editor.media
+\t\t\t\t.getAssets()
+\t\t\t\t.find((asset) => asset.id === upload.voiceBeautifyMediaId);
+\t\t\tupdateElement({
+\t\t\t\tupdates: {
+\t\t\t\t\tmediaId: upload.voiceBeautifyMediaId,
+\t\t\t\t\tname: processed?.name ?? upload.name,
+\t\t\t\t\tvoiceBeautifyEnabled: true,
+\t\t\t\t},
+\t\t\t});
+\t\t\tsetBeautifyStatus("");
+\t\t\treturn;
+\t\t}
+\t\tvoid runVocalBeautify();
 \t};
 
 '''
 
-VOCAL_CARD = '''\t\t\t\t<PropertyGroup title="人声美化" collapsible={false}>
-\t\t\t\t\t{element.sourceType === "upload" ? (
-\t\t\t\t\t\t<div className="flex flex-col gap-2">
-\t\t\t\t\t\t\t<PropertyItem direction="column">
-\t\t\t\t\t\t\t\t<PropertyItemLabel>强度</PropertyItemLabel>
-\t\t\t\t\t\t\t\t<PropertyItemValue>
-\t\t\t\t\t\t\t\t\t<div className="flex items-center gap-2">
-\t\t\t\t\t\t\t\t\t\t<Slider
-\t\t\t\t\t\t\t\t\t\t\tvalue={[Math.round(beautifyStrength * 100)]}
-\t\t\t\t\t\t\t\t\t\t\tonValueChange={([value]) =>
-\t\t\t\t\t\t\t\t\t\t\t\tsetBeautifyStrength(
-\t\t\t\t\t\t\t\t\t\t\t\t\tclamp({ value: value ?? 80, min: 0, max: 100 }) / 100,
-\t\t\t\t\t\t\t\t\t\t\t\t)
-\t\t\t\t\t\t\t\t\t\t\t}
-\t\t\t\t\t\t\t\t\t\t\tclassName="flex-1"
-\t\t\t\t\t\t\t\t\t\t\tdisabled={beautifyBusy}
-\t\t\t\t\t\t\t\t\t\t/>
-\t\t\t\t\t\t\t\t\t\t<span className="text-muted-foreground w-10 text-right text-xs">
-\t\t\t\t\t\t\t\t\t\t\t{Math.round(beautifyStrength * 100)}%
-\t\t\t\t\t\t\t\t\t\t</span>
-\t\t\t\t\t\t\t\t\t</div>
-\t\t\t\t\t\t\t\t</PropertyItemValue>
-\t\t\t\t\t\t\t</PropertyItem>
-\t\t\t\t\t\t\t<button
-\t\t\t\t\t\t\t\ttype="button"
-\t\t\t\t\t\t\t\tdisabled={beautifyBusy}
-\t\t\t\t\t\t\t\tonClick={() => {
-\t\t\t\t\t\t\t\t\tvoid runVocalBeautify();
-\t\t\t\t\t\t\t\t}}
-\t\t\t\t\t\t\t\tclassName="bg-accent hover:bg-accent/80 h-7 w-full rounded-sm px-2 text-xs disabled:opacity-50"
-\t\t\t\t\t\t\t>
-\t\t\t\t\t\t\t\t{beautifyBusy
-\t\t\t\t\t\t\t\t\t? "处理中…"
-\t\t\t\t\t\t\t\t\t: (element as UploadAudioElement).voiceBeautifySourceId
-\t\t\t\t\t\t\t\t\t\t? "重新处理"
-\t\t\t\t\t\t\t\t\t\t: "应用人声美化"}
-\t\t\t\t\t\t\t</button>
-\t\t\t\t\t\t\t<span className="text-muted-foreground text-[11px] leading-tight">
-\t\t\t\t\t\t\t\t{beautifyStatus || "去混响 / 去喷麦 / 降噪 / 提升清晰度"}
-\t\t\t\t\t\t\t</span>
-\t\t\t\t\t\t</div>
-\t\t\t\t\t) : (
-\t\t\t\t\t\t<span className="text-muted-foreground text-[11px]">仅支持本地音频素材</span>
-\t\t\t\t\t)}
-\t\t\t\t</PropertyGroup>
+VOCAL_CARD = '''\t\t\t\t{element.sourceType === "upload" ? (
+\t\t\t\t\t<VocalBeautifyRow
+\t\t\t\t\t\tenabled={beautifyEnabled}
+\t\t\t\t\t\tbusy={beautifyBusy}
+\t\t\t\t\t\tstrength={beautifyStrength}
+\t\t\t\t\t\tstatus={beautifyStatus}
+\t\t\t\t\t\tprogress={beautifyProgress}
+\t\t\t\t\t\tneedsApply={
+\t\t\t\t\t\t\tbeautifyEnabled &&
+\t\t\t\t\t\t\tMath.abs((beautifyAppliedStrength ?? -1) - beautifyStrength) > 0.001
+\t\t\t\t\t\t}
+\t\t\t\t\t\tonToggle={toggleVocalBeautify}
+\t\t\t\t\t\tonStrengthChange={(value) => {
+\t\t\t\t\t\t\tsetBeautifyStrength(clamp({ value, min: 0, max: 1 }));
+\t\t\t\t\t\t}}
+\t\t\t\t\t\tonApply={() => {
+\t\t\t\t\t\t\tvoid runVocalBeautify();
+\t\t\t\t\t\t}}
+\t\t\t\t\t/>
+\t\t\t\t) : (
+\t\t\t\t\t<PropertyGroup title="人声美化" collapsible={false}>
+\t\t\t\t\t\t<span className="text-muted-foreground text-[11px]">
+\t\t\t\t\t\t\t仅支持本地音频素材
+\t\t\t\t\t\t</span>
+\t\t\t\t\t</PropertyGroup>
+\t\t\t\t)}
 
 '''
 
@@ -6971,12 +7196,13 @@ if "applyVocalBeautify" not in _panel:
     _panel = _panel.replace(
         'import type { AudioElement } from "@/types/timeline";',
         'import type { AudioElement, UploadAudioElement } from "@/types/timeline";\n'
-        'import {\n\tapplyVocalBeautify,\n\tdescribeVocalBeautify,\n} from "@/lib/audio/vocal-beautify";',
+        'import {\n\tapplyVocalBeautify,\n\tdescribeVocalBeautify,\n} from "@/lib/audio/vocal-beautify";\n'
+        'import { VocalBeautifyRow } from "./vocal-beautify-row";',
         1,
     )
     _panel = _panel.replace(
         'import { useReducer, useRef } from "react";',
-        'import { useReducer, useRef, useState } from "react";',
+        'import { useEffect, useReducer, useRef, useState } from "react";',
         1,
     )
     _panel = _panel.replace(
@@ -7080,3 +7306,2765 @@ if _MOBILE_HEADER.is_file():
         _t = _t.replace("\tBubbleChatIcon,\n", "")
         _MOBILE_HEADER.write_text(_t, encoding="utf-8")
         print("  patched mobile-header.tsx (去掉反馈菜单项)")
+
+
+# ------------------------------------------------- 字幕导入（SRT / TXT，与导出对应）
+SUBTITLE_FORMAT = SRC / "lib" / "transcription" / "subtitle-format.ts"
+SUBTITLE_FORMAT_SOURCE = '''/**
+ * 字幕文件解析：与导出的两种格式一一对应。
+ *
+ * - SRT：带时间码（`HH:MM:SS,mmm --> HH:MM:SS,mmm`），导入后按文件时间落到时间线
+ * - TXT：一行一条字幕，导入后从播放头开始按模板时长顺排
+ *
+ * 导出侧见 `@/lib/export` 的 buildSubtitleFile：srt 用 `,` 分隔毫秒，txt 一行一条。
+ */
+
+export type SubtitleFormat = "srt" | "txt";
+
+export interface SubtitleCue {
+\t/** 相对字幕文件开头的开始时间（秒） */
+\tstart: number;
+\t/** 结束时间（秒），至少比 start 晚 0.2 秒 */
+\tend: number;
+\ttext: string;
+}
+
+const TIMECODE =
+\t/(\\d{1,3}):(\\d{2}):(\\d{2})[,.](\\d{1,4})\\s*-->\\s*(\\d{1,3}):(\\d{2}):(\\d{2})[,.](\\d{1,4})/;
+
+function normalize({ text }: { text: string }): string {
+\treturn text.replace(/^\\uFEFF/, "").replace(/\\r\\n?/g, "\\n");
+}
+
+function toSeconds({
+\thours,
+\tminutes,
+\tseconds,
+\tfraction,
+}: {
+\thours: string;
+\tminutes: string;
+\tseconds: string;
+\tfraction: string;
+}): number {
+\tconst millis = Number(fraction.padEnd(3, "0"));
+\treturn (
+\t\tNumber(hours) * 3600 + Number(minutes) * 60 + Number(seconds) + millis / 1000
+\t);
+}
+
+export function detectSubtitleFormat({ text }: { text: string }): SubtitleFormat {
+\treturn TIMECODE.test(normalize({ text })) ? "srt" : "txt";
+}
+
+/** 解析 SRT；不是 SRT（没有时间码）时返回空数组。 */
+export function parseSubtitleCues({ text }: { text: string }): SubtitleCue[] {
+\tconst source = normalize({ text });
+\tif (!TIMECODE.test(source)) {
+\t\treturn [];
+\t}
+
+\tconst cues: SubtitleCue[] = [];
+\tfor (const block of source.split(/\\n{2,}/)) {
+\t\tconst lines = block
+\t\t\t.split("\\n")
+\t\t\t.map((line) => line.trim())
+\t\t\t.filter(Boolean);
+\t\tif (lines.length === 0) {
+\t\t\tcontinue;
+\t\t}
+
+\t\tconst timeIndex = lines.findIndex((line) => TIMECODE.test(line));
+\t\tif (timeIndex === -1) {
+\t\t\tcontinue;
+\t\t}
+\t\tconst match = TIMECODE.exec(lines[timeIndex]);
+\t\tif (!match) {
+\t\t\tcontinue;
+\t\t}
+
+\t\tconst start = toSeconds({
+\t\t\thours: match[1],
+\t\t\tminutes: match[2],
+\t\t\tseconds: match[3],
+\t\t\tfraction: match[4],
+\t\t});
+\t\tconst end = toSeconds({
+\t\t\thours: match[5],
+\t\t\tminutes: match[6],
+\t\t\tseconds: match[7],
+\t\t\tfraction: match[8],
+\t\t});
+\t\tconst content = lines.slice(timeIndex + 1).join("\\n");
+\t\tif (!content) {
+\t\t\tcontinue;
+\t\t}
+\t\tcues.push({ start, end: Math.max(start + 0.2, end), text: content });
+\t}
+
+\treturn cues;
+}
+
+/** 面板上显示的条数：SRT 按条数算，TXT 按非空行数算。 */
+export function countSubtitleEntries({ text }: { text: string }): number {
+\tconst cues = parseSubtitleCues({ text });
+\tif (cues.length > 0) {
+\t\treturn cues.length;
+\t}
+\treturn normalize({ text })
+\t\t.split("\\n")
+\t\t.map((line) => line.trim())
+\t\t.filter(Boolean).length;
+}
+'''
+write(SUBTITLE_FORMAT, SUBTITLE_FORMAT_SOURCE)
+
+
+IMPORT_TS = SRC / "lib" / "transcription" / "import.ts"
+patch(
+    IMPORT_TS,
+    'import { FONT_SIZE_SCALE_REFERENCE } from "@/constants/text-constants";',
+    'import { FONT_SIZE_SCALE_REFERENCE } from "@/constants/text-constants";\n'
+    'import { parseSubtitleCues } from "./subtitle-format";',
+)
+patch(
+    IMPORT_TS,
+    "\tconst lines = parseCaptionLines({ text });",
+    "\t// 贴进来/选进来的可能是 SRT（带时间码）或纯文本（一行一条）\n"
+    "\tconst cues = parseSubtitleCues({ text });\n"
+    "\tconst lines =\n"
+    "\t\tcues.length > 0 ? cues.map((cue) => cue.text) : parseCaptionLines({ text });",
+)
+patch(
+    IMPORT_TS,
+    "\tlet nextStartTime = startTime;\n"
+    "\tfor (const [index, line] of lines.entries()) {\n"
+    "\t\tconst caption = createSubtitleFromTemplate({\n"
+    "\t\t\ttemplate,\n"
+    "\t\t\tstartTime: nextStartTime,\n"
+    "\t\t});",
+    "\tlet nextStartTime = startTime;\n"
+    "\tfor (const [index, line] of lines.entries()) {\n"
+    "\t\tconst cue = cues[index];\n"
+    "\t\tconst caption = createSubtitleFromTemplate({\n"
+    "\t\t\ttemplate,\n"
+    "\t\t\t// SRT 用文件里的时间码（以播放头为 0 点），纯文本按模板时长顺排\n"
+    "\t\t\tstartTime: cue ? startTime + cue.start : nextStartTime,\n"
+    "\t\t});\n"
+    "\t\tif (cue) {\n"
+    "\t\t\tcaption.duration = Math.max(0.2, cue.end - cue.start);\n"
+    "\t\t}",
+)
+
+
+CAPTIONS_PANEL = SRC / "components" / "editor" / "panels" / "assets" / "views" / "captions.tsx"
+patch(
+    CAPTIONS_PANEL,
+    "import { useState, useRef, useMemo } from \"react\";",
+    "import { useState, useRef, useMemo, type ChangeEvent } from \"react\";",
+)
+patch(
+    CAPTIONS_PANEL,
+    'import { parseCaptionLines } from "@/lib/transcription/import";',
+    'import { countSubtitleEntries } from "@/lib/transcription/subtitle-format";',
+)
+patch(
+    CAPTIONS_PANEL,
+    "() => parseCaptionLines({ text: captionText }).length,",
+    "() => countSubtitleEntries({ text: captionText }),",
+)
+patch(
+    CAPTIONS_PANEL,
+    "() => parseCaptionLines({ text: secondaryCaptionText }).length,",
+    "() => countSubtitleEntries({ text: secondaryCaptionText }),",
+)
+patch(
+    CAPTIONS_PANEL,
+    "\tconst containerRef = useRef<HTMLDivElement>(null);",
+    "\tconst containerRef = useRef<HTMLDivElement>(null);\n"
+    "\tconst subtitleFileRef = useRef<HTMLInputElement>(null);",
+)
+patch(
+    CAPTIONS_PANEL,
+    "\tconst handleLanguageChange = ({ value }: { value: string }) => {",
+    "\t/** 选中 .srt / .txt 后直接读进文本框，后面的导入流程会自动识别格式。 */\n"
+    "\tconst handleSubtitleFile = async (event: ChangeEvent<HTMLInputElement>) => {\n"
+    "\t\tconst file = event.target.files?.[0];\n"
+    "\t\tevent.target.value = \"\";\n"
+    "\t\tif (!file) return;\n"
+    "\t\ttry {\n"
+    "\t\t\tconst text = await file.text();\n"
+    "\t\t\tsetIsEditingSecondary(false);\n"
+    "\t\t\tsetCaptionText({ value: text });\n"
+    "\t\t\tsetError(null);\n"
+    "\t\t} catch {\n"
+    "\t\t\tsetError(t(\"Failed to read the subtitle file\"));\n"
+    "\t\t}\n"
+    "\t};\n\n"
+    "\tconst handleLanguageChange = ({ value }: { value: string }) => {",
+)
+patch(
+    CAPTIONS_PANEL,
+    '\t\t\t\t\t\t<Textarea\n\t\t\t\t\t\t\tid="caption-import-text"',
+    "\t\t\t\t\t\t<div className=\"flex items-center gap-2\">\n"
+    "\t\t\t\t\t\t\t<Button\n"
+    "\t\t\t\t\t\t\t\ttype=\"button\"\n"
+    "\t\t\t\t\t\t\t\tvariant=\"outline\"\n"
+    "\t\t\t\t\t\t\t\tsize=\"sm\"\n"
+    "\t\t\t\t\t\t\t\tdisabled={isProcessing}\n"
+    "\t\t\t\t\t\t\t\tonClick={() => subtitleFileRef.current?.click()}\n"
+    "\t\t\t\t\t\t\t>\n"
+    "\t\t\t\t\t\t\t\t{t(\"Import .srt / .txt file\")}\n"
+    "\t\t\t\t\t\t\t</Button>\n"
+    "\t\t\t\t\t\t\t<input\n"
+    "\t\t\t\t\t\t\t\tref={subtitleFileRef}\n"
+    "\t\t\t\t\t\t\t\ttype=\"file\"\n"
+    "\t\t\t\t\t\t\t\taccept=\".srt,.txt,text/plain\"\n"
+    "\t\t\t\t\t\t\t\tclassName=\"hidden\"\n"
+    "\t\t\t\t\t\t\t\tonChange={handleSubtitleFile}\n"
+    "\t\t\t\t\t\t\t/>\n"
+    "\t\t\t\t\t\t\t<span className=\"text-muted-foreground text-xs\">\n"
+    "\t\t\t\t\t\t\t\t{t(\"SRT keeps its timing, TXT is one subtitle per line\")}\n"
+    "\t\t\t\t\t\t\t</span>\n"
+    "\t\t\t\t\t\t</div>\n"
+    '\t\t\t\t\t\t<Textarea\n\t\t\t\t\t\t\tid="caption-import-text"',
+)
+
+
+# 新增字幕导入文案的中文对照（项目惯例：按当前语言直接给中文，不走翻译包）
+patch(
+    SUBTITLE_FORMAT,
+    "/** 面板上显示的条数：SRT 按条数算，TXT 按非空行数算。 */",
+    "/** 新增界面文案的中文对照（其它语言回退英文） */\n"
+    "const SUBTITLE_LABELS_ZH: Record<string, string> = {\n"
+    '\t"Import .srt / .txt file": "导入 .srt / .txt 文件",\n'
+    '\t"SRT keeps its timing, TXT is one subtitle per line":\n'
+    '\t\t"SRT 保留时间码，TXT 一行一条",\n'
+    '\t"Failed to read the subtitle file": "字幕文件读取失败",\n'
+    "};\n\n"
+    "export function subtitleUiLabel({ key }: { key: string }): string {\n"
+    "\tconst isChinese =\n"
+    '\t\ttypeof window !== "undefined" &&\n'
+    '\t\twindow.location.pathname.split("/").includes("zh");\n'
+    "\treturn (isChinese && SUBTITLE_LABELS_ZH[key]) || key;\n"
+    "}\n\n"
+    "/** 面板上显示的条数：SRT 按条数算，TXT 按非空行数算。 */",
+)
+patch(
+    CAPTIONS_PANEL,
+    'import { countSubtitleEntries } from "@/lib/transcription/subtitle-format";',
+    "import {\n\tcountSubtitleEntries,\n\tsubtitleUiLabel,\n} from \"@/lib/transcription/subtitle-format\";",
+)
+patch(
+    CAPTIONS_PANEL,
+    'setError(t("Failed to read the subtitle file"));',
+    'setError(subtitleUiLabel({ key: "Failed to read the subtitle file" }));',
+)
+patch(
+    CAPTIONS_PANEL,
+    '{t("Import .srt / .txt file")}',
+    '{subtitleUiLabel({ key: "Import .srt / .txt file" })}',
+)
+patch(
+    CAPTIONS_PANEL,
+    '{t("SRT keeps its timing, TXT is one subtitle per line")}',
+    '{\n\t\t\t\t\t\t\t\t\tsubtitleUiLabel({\n'
+    '\t\t\t\t\t\t\t\t\t\tkey: "SRT keeps its timing, TXT is one subtitle per line",\n'
+    "\t\t\t\t\t\t\t\t\t})\n"
+    "\t\t\t\t\t\t\t\t}",
+)
+
+
+# --------------------------------------------- 转录字幕：中文按标点断句、去标点
+CAPTION_TEXT = SRC / "lib" / "transcription" / "caption-text.ts"
+CAPTION_TEXT_SOURCE = '''/**
+ * 转录文本切字幕（中文/日文这类没有空格的语言）。
+ *
+ * 关键点（都是踩过的坑）：
+ *
+ * - 中文按标点断句，**标点不保留**在字幕里
+ * - 中文里夹英文（`这个是 Python 代码`）时，**空格不是断点**，
+ *   英文单词也不会被拆开；行首行尾不会留空格
+ * - 数字/时间里的标点不当句末：`1.0`、`10:30`、`3,000` 不会被切开
+ * - 断点优先落在自然位置（助词后 / 连接词前），行长贴近理想值
+ * - 只处理中日韩文本；英文等有空格的语言仍走上游按词切分
+ */
+
+/** 中日韩文字（含假名、谚文），判断是否走中文切分 */
+const CJK_PATTERN = /[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF]/u;
+
+/** 中日韩标点：出现即断句，且不保留 */
+const CJK_PUNCTUATION = new Set(["。", "！", "？", "；", "，", "、", "：", "…", "．", "｡", "，"]);
+
+/** 西文标点：只有在「后面是空格/中文/结尾」时才算句末，避免切开 1.0 / 10:30 / 3,000 */
+const ASCII_PUNCTUATION = new Set([".", "!", "?", ";", ",", ":"]);
+
+/** 单条字幕最大字数（中文按字算，英文字母各占 1） */
+export const MAX_CAPTION_CHARS = 16;
+
+/** 一行至少几个字 */
+const MIN_LINE_CHARS = 5;
+
+/** 适合收尾、不适合开头的助词 */
+const DEPENDENT_PREFIX = new Set([
+\t"的", "地", "得", "了", "着", "过", "吗", "呢", "吧", "啊", "嘛", "呀", "哦",
+]);
+
+/** 适合开头、不适合收尾的连接词 */
+const BREAK_BEFORE = new Set([
+\t"然后", "所以", "但是", "不过", "而且", "因为", "如果", "就是", "我们", "你们",
+\t"他们", "这个", "那个", "可以", "需要", "现在", "今天", "明天", "一下", "其实",
+\t"另外", "比如", "首先", "其次", "最后", "虽然", "只是", "还是", "或者",
+]);
+
+export function countCaptionUnits({ text }: { text: string }): number {
+\tconst clean = text.trim();
+\tif (!clean) return 0;
+\tif (CJK_PATTERN.test(clean)) {
+\t\t// 标点与空格既不占语速也不占字幕时间
+\t\treturn clean.replace(/\\s+/g, "").replace(/[。！？；，、：…．｡!?;:,.]+/g, "").length;
+\t}
+\treturn clean.split(/\\s+/).filter(Boolean).length;
+}
+
+/**
+ * 按标点断句。西文标点要看上下文：`1.0`、`10:30`、`3,000` 里的不算句末。
+ */
+function splitClauses({ text }: { text: string }): string[] {
+\tconst clauses: string[] = [];
+\tlet current = "";
+
+\tfor (let i = 0; i < text.length; i += 1) {
+\t\tconst char = text[i];
+\t\tconst next = text[i + 1];
+\t\tconst previous = text[i - 1];
+
+\t\tif (CJK_PUNCTUATION.has(char)) {
+\t\t\tclauses.push(current);
+\t\t\tcurrent = "";
+\t\t\tcontinue;
+\t\t}
+
+\t\tif (ASCII_PUNCTUATION.has(char)) {
+\t\t\tconst digitBefore = previous !== undefined && /\\d/.test(previous);
+\t\t\tconst digitAfter = next !== undefined && /\\d/.test(next);
+\t\t\tconst letterBefore = previous !== undefined && /[A-Za-z]/.test(previous);
+\t\t\tconst letterAfter = next !== undefined && /[A-Za-z]/.test(next);
+\t\t\t// 数字内（1.0 / 10:30 / 3,000）、缩写（e.g / U.S）都不算句末
+\t\t\tconst insideNumber =
+\t\t\t\t(digitBefore && digitAfter) ||
+\t\t\t\t(char === ":" && digitBefore && digitAfter) ||
+\t\t\t\t(char === "." && digitBefore && digitAfter);
+\t\t\tconst insideAbbreviation = char === "." && letterBefore && letterAfter;
+\t\t\tconst followedByBoundary =
+\t\t\t\tnext === undefined || /\\s/.test(next) || CJK_PATTERN.test(next);
+\t\t\tif (!insideNumber && !insideAbbreviation && followedByBoundary) {
+\t\t\t\tclauses.push(current);
+\t\t\t\tcurrent = "";
+\t\t\t\tcontinue;
+\t\t\t}
+\t\t}
+
+\t\tcurrent += char;
+\t}
+\tclauses.push(current);
+\treturn clauses.map((clause) => clause.replace(/\\s+/g, " ").trim()).filter(Boolean);
+}
+
+/**
+ * 分词：中日韩走 ICU 词典；空格**不作为独立片段**，而是粘在前一个词后面，
+ * 这样断行永远不会落在空格上，行首行尾也不会留空格。
+ */
+function splitWords({ text }: { text: string }): string[] {
+\tlet raw: string[];
+\ttry {
+\t\tconst segmenter = new Intl.Segmenter("zh", { granularity: "word" });
+\t\traw = Array.from(segmenter.segment(text), (item) => item.segment);
+\t} catch {
+\t\traw = Array.from(text);
+\t}
+
+\tconst words: string[] = [];
+\tfor (const piece of raw) {
+\t\tif (!piece) continue;
+\t\tif (piece.trim().length === 0) {
+\t\t\t// 空白：粘到前一个词上，避免成为断点
+\t\t\tif (words.length > 0) {
+\t\t\t\twords[words.length - 1] = `${words[words.length - 1]}${piece}`;
+\t\t\t} else {
+\t\t\t\twords.push(piece);
+\t\t\t}
+\t\t\tcontinue;
+\t\t}
+\t\twords.push(piece);
+\t}
+\treturn words;
+}
+
+/** 这个断点够不够自然（不做空格断点：空格已经粘进词里） */
+function isNaturalBoundary({
+\tprevious,
+\tnext,
+}: {
+\tprevious: string | undefined;
+\tnext: string | undefined;
+}): boolean {
+\tif (!previous || !next) return false;
+\tif (previous.trim() !== previous) return false;
+\tif (next.trim() !== next) return false;
+\tif (previous.length === 1 && !DEPENDENT_PREFIX.has(previous)) return false;
+\tif (BREAK_BEFORE.has(previous)) return false;
+\tif (DEPENDENT_PREFIX.has(next)) return false;
+\treturn true;
+}
+
+/** 把词装箱成行：不切词、不在空格处断行，行长贴近理想值 */
+function packWords({ words, limit }: { words: string[]; limit: number }): string[][] {
+\tconst groups: string[][] = [];
+\tconst ideal = Math.max(MIN_LINE_CHARS, Math.round(limit * 0.8));
+\tlet index = 0;
+
+\twhile (index < words.length) {
+\t\tlet length = 0;
+\t\tlet end = index;
+\t\tlet bestCut = -1;
+\t\tlet bestGap = Number.POSITIVE_INFINITY;
+
+\t\twhile (end < words.length && length + words[end].length <= limit) {
+\t\t\tconst piece = words[end].trimEnd();
+\t\t\tlength += words[end].length;
+\t\t\tconst cut = end + 1;
+\t\t\tif (
+\t\t\t\tcut < words.length &&
+\t\t\t\tlength >= MIN_LINE_CHARS &&
+\t\t\t\tisNaturalBoundary({ previous: piece, next: words[cut].trimStart() })
+\t\t\t) {
+\t\t\t\tconst gap = Math.abs(length - ideal);
+\t\t\t\tif (gap < bestGap) {
+\t\t\t\t\tbestGap = gap;
+\t\t\t\t\tbestCut = cut;
+\t\t\t\t}
+\t\t\t}
+\t\t\tend += 1;
+\t\t}
+
+\t\tif (end === index) {
+\t\t\t// 单个词就超上限：英文单词/链接不硬拆，实在过长才切
+\t\t\tconst word = words[index].trimEnd();
+\t\t\tif (word.length <= limit * 2) {
+\t\t\t\tgroups.push([word]);
+\t\t\t} else {
+\t\t\t\tfor (let i = 0; i < word.length; i += limit) {
+\t\t\t\t\tgroups.push([word.slice(i, i + limit)]);
+\t\t\t\t}
+\t\t\t}
+\t\t\tindex += 1;
+\t\t\tcontinue;
+\t\t}
+
+\t\tif (end >= words.length) {
+\t\t\tgroups.push(words.slice(index, end));
+\t\t\tbreak;
+\t\t}
+
+\t\tif (bestCut < 0) {
+\t\t\tlet acc = 0;
+\t\t\tlet gap = Number.POSITIVE_INFINITY;
+\t\t\tfor (let i = index; i < end; i += 1) {
+\t\t\t\tacc += words[i].trimEnd().length;
+\t\t\t\tconst candidateGap = Math.abs(acc - ideal);
+\t\t\t\tif (acc >= MIN_LINE_CHARS && candidateGap < gap) {
+\t\t\t\t\tgap = candidateGap;
+\t\t\t\t\tbestCut = i + 1;
+\t\t\t\t}
+\t\t\t}
+\t\t}
+\t\tif (bestCut < 0) bestCut = end;
+
+\t\tgroups.push(words.slice(index, bestCut));
+\t\tindex = bestCut;
+\t}
+
+\treturn smoothBoundaries({ groups, limit });
+}
+
+/** 兜底：换行处仍不自然时，把上一行最后一个词挪到下一行行首 */
+function smoothBoundaries({
+\tgroups,
+\tlimit,
+}: {
+\tgroups: string[][];
+\tlimit: number;
+}): string[][] {
+\tfor (let i = 0; i + 1 < groups.length; i += 1) {
+\t\tconst current = groups[i];
+\t\tconst next = groups[i + 1];
+\t\tif (current.length <= 1 || next.length === 0) continue;
+\t\tconst rawWord = current[current.length - 1];
+\t\tconst lastWord = rawWord.trimEnd();
+\t\tif (isNaturalBoundary({ previous: lastWord, next: next[0].trimStart() })) continue;
+\t\tif (current.join("").trimEnd().length - lastWord.length < MIN_LINE_CHARS) continue;
+\t\tif (next.join("").trimEnd().length + rawWord.length > limit) continue;
+\t\tcurrent.pop();
+\t\tnext.unshift(rawWord);
+\t}
+\treturn groups;
+}
+
+/** 尾部只剩 1~2 字时，从上一行挪词过来 */
+function fixShortTail({ groups }: { groups: string[][] }): string[][] {
+\tconst minChars = 3;
+\twhile (groups.length > 1) {
+\t\tconst last = groups[groups.length - 1];
+\t\tconst previous = groups[groups.length - 2];
+\t\tif (last.join("").trim().length >= minChars || previous.length <= 1) break;
+\t\tlast.unshift(previous.pop() as string);
+\t}
+\treturn groups;
+}
+
+/** 只有 1~2 字的碎句（"哦""好的"）并回上一条 */
+function mergeTinyClauses({
+\tgroups,
+\tlimit,
+}: {
+\tgroups: string[][];
+\tlimit: number;
+}): string[][] {
+\tconst merged: string[][] = [];
+\tfor (const group of groups) {
+\t\tconst size = group.join("").trim().length;
+\t\tconst last = merged[merged.length - 1];
+\t\tif (last && size <= 2 && last.join("").trim().length + size <= limit + 2) {
+\t\t\tlast.push(...group);
+\t\t\tcontinue;
+\t\t}
+\t\tmerged.push([...group]);
+\t}
+\treturn merged;
+}
+
+/**
+ * 把一段转录文本切成若干条字幕。
+ *
+ * 不是中日韩文本时返回空数组，调用方继续用上游的「按词切」逻辑。
+ */
+export function splitCaptionText({
+\ttext,
+\tmaxChars = MAX_CAPTION_CHARS,
+}: {
+\ttext: string;
+\tmaxChars?: number;
+}): string[] {
+\tconst clean = text.replace(/\\s+/g, " ").trim();
+\tif (!clean || !CJK_PATTERN.test(clean)) return [];
+
+\tconst limit = Math.max(8, Math.floor(maxChars));
+\tconst groups: string[][] = [];
+\tfor (const clause of splitClauses({ text: clean })) {
+\t\tconst words = splitWords({ text: clause });
+\t\tif (words.length === 0) continue;
+\t\tgroups.push(...fixShortTail({ groups: packWords({ words, limit }) }));
+\t}
+
+\treturn mergeTinyClauses({ groups, limit })
+\t\t.map((group) => group.join("").replace(/\\s+/g, " ").trim())
+\t\t.filter(Boolean);
+}
+'''
+write(CAPTION_TEXT, CAPTION_TEXT_SOURCE)
+
+
+CAPTION_LIB = SRC / "lib" / "transcription" / "caption.ts"
+patch(
+    CAPTION_LIB,
+    'import {\n\tDEFAULT_WORDS_PER_CAPTION,\n\tMIN_CAPTION_DURATION_SECONDS,\n} from "@/constants/transcription-constants";',
+    'import {\n\tDEFAULT_WORDS_PER_CAPTION,\n\tMIN_CAPTION_DURATION_SECONDS,\n} from "@/constants/transcription-constants";\n'
+    'import { countCaptionUnits, splitCaptionText } from "./caption-text";',
+)
+patch(
+    CAPTION_LIB,
+    "\t\tconst wordsPerSecond = words.length / segmentDuration;",
+    "\t\t// 中日韩按字算语速，英语按词算\n"
+    "\t\tconst unitsPerSecond = Math.max(\n"
+    "\t\t\t0.001,\n"
+    "\t\t\tcountCaptionUnits({ text }) / segmentDuration,\n"
+    "\t\t);",
+)
+patch(
+    CAPTION_LIB,
+    "\t\tconst chunks: string[] = [];\n"
+    "\t\tfor (let i = 0; i < words.length; i += wordsPerChunk) {\n"
+    "\t\t\tchunks.push(words.slice(i, i + wordsPerChunk).join(\" \"));\n"
+    "\t\t}",
+    "\t\t// 中文没有空格：按标点断句、每行限字（标点不保留）\n"
+    "\t\tconst chunks: string[] = splitCaptionText({ text });\n"
+    "\t\tif (chunks.length === 0) {\n"
+    "\t\t\tfor (let i = 0; i < words.length; i += wordsPerChunk) {\n"
+    "\t\t\t\tchunks.push(words.slice(i, i + wordsPerChunk).join(\" \"));\n"
+    "\t\t\t}\n"
+    "\t\t}",
+)
+patch(
+    CAPTION_LIB,
+    "\t\t\tconst chunkWords = chunk.split(/\\s+/).length;",
+    "\t\t\tconst chunkUnits = Math.max(1, countCaptionUnits({ text: chunk }));",
+)
+patch(
+    CAPTION_LIB,
+    "\t\t\t\tMath.max(minDuration, chunkWords / wordsPerSecond),",
+    "\t\t\t\tMath.max(minDuration, chunkUnits / unitsPerSecond),",
+)
+
+
+
+# ------------------------------------ 视频片段：名称/时长 + 画面 + 半波形三段式
+# 波形直接复用音频轨道那套（AudioWaveform / wavesurfer），只是把它按 2 倍高度渲染、
+# 再裁掉下半部分——这样「只显示上半边」，颜色/粗细/加载态都和音频轨道完全一致。
+TIMELINE_ELEMENT = SRC / "components" / "editor" / "panels" / "timeline" / "timeline-element.tsx"
+patch(
+    TIMELINE_ELEMENT,
+    '''\t\treturn (
+\t\t\t<div className="relative size-full">
+\t\t\t\t<VideoThumbnailStrip''',
+    '''\t\t// 上 1/4：名称 + 时长；中 1/2：画面；下 1/4：波形上半边
+\t\tconst bandHeight = Math.max(8, Math.round(trackHeight / 4));
+\t\treturn (
+\t\t\t<div className="flex size-full flex-col">
+\t\t\t\t<div
+\t\t\t\t\tclassName="flex shrink-0 items-center gap-1 overflow-hidden px-1.5"
+\t\t\t\t\tstyle={{ height: bandHeight }}
+\t\t\t\t>
+\t\t\t\t\t<span className="truncate text-[10px] leading-none text-white/90">
+\t\t\t\t\t\t{element.name}
+\t\t\t\t\t</span>
+\t\t\t\t\t<span className="ml-auto shrink-0 text-[10px] leading-none tabular-nums text-white/60">
+\t\t\t\t\t\t{element.duration.toFixed(1)}s
+\t\t\t\t\t</span>
+\t\t\t\t</div>
+\t\t\t\t<div className="relative min-h-0 flex-1 overflow-hidden">
+\t\t\t\t<VideoThumbnailStrip''',
+)
+patch(
+    TIMELINE_ELEMENT,
+    '''\t\t\t\t\ttrackHeight={trackHeight}
+\t\t\t\t\tzoomLevel={zoomLevel}
+\t\t\t\t\tfps={mediaAsset.fps ?? 30}
+\t\t\t\t\tmediaWidth={mediaAsset.width ?? 1920}
+\t\t\t\t\tmediaHeight={mediaAsset.height ?? 1080}
+\t\t\t\t/>
+\t\t\t</div>
+\t\t);''',
+    '''\t\t\t\t\ttrackHeight={trackHeight - bandHeight * 2}
+\t\t\t\t\tzoomLevel={zoomLevel}
+\t\t\t\t\tfps={mediaAsset.fps ?? 30}
+\t\t\t\t\tmediaWidth={mediaAsset.width ?? 1920}
+\t\t\t\t\tmediaHeight={mediaAsset.height ?? 1080}
+\t\t\t\t/>
+\t\t\t\t</div>
+\t\t\t\t{/* 波形按 2 倍高度渲染，容器只露上半部分 → 只显示上半边 */}
+\t\t\t\t<div className="relative shrink-0 overflow-hidden" style={{ height: bandHeight }}>
+\t\t\t\t\t<div className="absolute inset-x-0 top-0" style={{ height: bandHeight * 2 }}>
+\t\t\t\t\t\t<AudioWaveform
+\t\t\t\t\t\t\taudioBlob={mediaAsset.file}
+\t\t\t\t\t\t\tduration={element.duration}
+\t\t\t\t\t\t\theight={bandHeight * 2}
+\t\t\t\t\t\t\tclassName="w-full"
+\t\t\t\t\t\t/>
+\t\t\t\t\t</div>
+\t\t\t\t</div>
+\t\t\t</div>
+\t\t);''',
+)
+
+
+# --------------------------------- 视频素材到底带不带音轨（不解码，只解封装）
+AUDIO_PROBE = SRC / "lib" / "media" / "audio-probe.ts"
+AUDIO_PROBE.write_text(
+    '''import { ALL_FORMATS, BlobSource, Input } from "mediabunny";
+import type { MediaAsset } from "@/types/assets";
+
+// 只解封装、不解码，几十毫秒；结果按素材 id 缓存，重复渲染不会反复探测。
+const cache = new Map<string, Promise<boolean>>();
+
+async function detect({ media }: { media: MediaAsset }): Promise<boolean> {
+\tif (media.type === "audio") return true;
+\tif (media.type !== "video" || !media.file) return false;
+\ttry {
+\t\tconst input = new Input({
+\t\t\tsource: new BlobSource(media.file),
+\t\t\tformats: ALL_FORMATS,
+\t\t});
+\t\tconst track = await input.getPrimaryAudioTrack();
+\t\treturn Boolean(track);
+\t} catch {
+\t\t// 探测失败别把功能藏起来，按「有音频」处理
+\t\treturn true;
+\t}
+}
+
+export function probeMediaHasAudio({
+\tmedia,
+}: {
+\tmedia: MediaAsset | null | undefined;
+}): Promise<boolean> | null {
+\tif (!media) return null;
+\tconst cached = cache.get(media.id);
+\tif (cached) return cached;
+\tconst pending = detect({ media });
+\tcache.set(media.id, pending);
+\treturn pending;
+}
+''',
+    encoding="utf-8",
+)
+print(f"  wrote {AUDIO_PROBE.relative_to(ROOT)} (音轨探测)")
+
+
+# ------------------------------- 视频属性面板：人声美化（勾选才处理）
+VIDEO_PANEL = VOICE_PANEL_DIR / "video-properties.tsx"
+_vp = VIDEO_PANEL.read_text(encoding="utf-8")
+
+VIDEO_HANDLER = '''\tconst localAsset =
+\t\telement.type === "video"
+\t\t\t? (editor.media.getAssets().find((asset) => asset.id === element.mediaId) ??
+\t\t\t\tnull)
+\t\t\t: null;
+\tconst [beautifyBusy, setBeautifyBusy] = useState(false);
+\tconst [beautifyStatus, setBeautifyStatus] = useState("");
+\tconst [beautifyStrength, setBeautifyStrength] = useState(
+\t\t(element as VideoElement).voiceBeautifyStrength ?? 0.8,
+\t);
+\tconst [assetHasAudio, setAssetHasAudio] = useState<boolean | null>(null);
+\tconst [beautifyProgress, setBeautifyProgress] = useState<number | null>(null);
+\t// 点击后先用本地状态把勾打上（不等处理完），等片段字段生效再交回去
+\tconst [beautifyOverride, setBeautifyOverride] = useState<boolean | null>(null);
+
+\tconst probeAssetId = element.type === "video" ? element.mediaId : "";
+\tuseEffect(() => {
+\t\tsetAssetHasAudio(null);
+\t\tif (!probeAssetId) return;
+\t\tconst media =
+\t\t\teditor.media.getAssets().find((asset) => asset.id === probeAssetId) ?? null;
+\t\tconst pending = probeMediaHasAudio({ media });
+\t\tif (!pending) return;
+\t\tlet cancelled = false;
+\t\tvoid pending.then((hasAudio) => {
+\t\t\tif (!cancelled) setAssetHasAudio(hasAudio);
+\t\t});
+\t\treturn () => {
+\t\t\tcancelled = true;
+\t\t};
+\t}, [editor, probeAssetId]);
+
+\tconst beautifyStoredEnabled =
+\t\telement.type === "video" && element.voiceBeautifyEnabled === true;
+\tconst beautifyEnabled = beautifyOverride ?? beautifyStoredEnabled;
+
+\tuseEffect(() => {
+\t\tif (beautifyOverride !== null && beautifyOverride === beautifyStoredEnabled) {
+\t\t\tsetBeautifyOverride(null);
+\t\t}
+\t}, [beautifyOverride, beautifyStoredEnabled]);
+
+\tconst updateClip = (updates: Partial<Record<string, unknown>>) => {
+\t\teditor.timeline.updateElements({
+\t\t\tupdates: [{ trackId, elementId: element.id, updates }],
+\t\t\tpushHistory: true,
+\t\t});
+\t};
+
+\tconst showBeautifyRow =
+\t\telement.type === "video" &&
+\t\t!element.muted &&
+\t\tassetHasAudio === true &&
+\t\tBoolean(localAsset?.file);
+
+\tconst runVideoBeautify = async () => {
+\t\tif (element.type !== "video" || beautifyBusy) return;
+\t\tconst source = editor.media
+\t\t\t.getAssets()
+\t\t\t.find((asset) => asset.id === element.mediaId);
+\t\tif (!source) {
+\t\t\tsetBeautifyOverride(null);
+\t\t\tsetBeautifyStatus("找不到原始素材");
+\t\t\treturn;
+\t\t}
+\t\tsetBeautifyBusy(true);
+\t\tsetBeautifyProgress(0);
+\t\tsetBeautifyStatus("准备中…");
+\t\ttry {
+\t\t\tconst result = await applyVocalBeautify({
+\t\t\t\teditor,
+\t\t\t\tsource,
+\t\t\t\tstrength: beautifyStrength,
+\t\t\t\tonProgress: (state) => {
+\t\t\t\t\tsetBeautifyStatus(describeVocalBeautify(state));
+\t\t\t\t\tsetBeautifyProgress(state.progress ?? 0);
+\t\t\t\t},
+\t\t\t});
+\t\t\tupdateClip({
+\t\t\t\tvoiceBeautifyEnabled: true,
+\t\t\t\tvoiceBeautifyMediaId: result.mediaId,
+\t\t\t\tvoiceBeautifyStrength: beautifyStrength,
+\t\t\t});
+\t\t\tsetBeautifyStatus("已处理：画面不变，声音换成处理后的音轨");
+\t\t} catch (error) {
+\t\t\tsetBeautifyOverride(null);
+\t\t\tsetBeautifyStatus(`失败：${(error as Error).message}`);
+\t\t} finally {
+\t\t\tsetBeautifyBusy(false);
+\t\t\tsetBeautifyProgress(null);
+\t\t}
+\t};
+
+\tconst toggleVideoBeautify = (checked: boolean) => {
+\t\tif (element.type !== "video" || beautifyBusy) return;
+\t\tsetBeautifyOverride(checked);
+\t\tif (!checked) {
+\t\t\tupdateClip({ voiceBeautifyEnabled: false });
+\t\t\tsetBeautifyStatus("");
+\t\t\treturn;
+\t\t}
+\t\tif (element.voiceBeautifyMediaId) {
+\t\t\tupdateClip({ voiceBeautifyEnabled: true });
+\t\t\tsetBeautifyStatus("");
+\t\t\treturn;
+\t\t}
+\t\tvoid runVideoBeautify();
+\t};
+
+'''
+
+VIDEO_CARD = '''\t\t\t\t{element.type === "video" && showBeautifyRow ? (
+\t\t\t\t\t<VocalBeautifyRow
+\t\t\t\t\t\tenabled={beautifyEnabled}
+\t\t\t\t\t\tbusy={beautifyBusy}
+\t\t\t\t\t\tstrength={beautifyStrength}
+\t\t\t\t\t\tstatus={beautifyStatus}
+\t\t\t\t\t\tprogress={beautifyProgress}
+\t\t\t\t\t\tneedsApply={
+\t\t\t\t\t\t\tbeautifyEnabled &&
+\t\t\t\t\t\t\tMath.abs(
+\t\t\t\t\t\t\t\t(element.voiceBeautifyStrength ?? -1) - beautifyStrength,
+\t\t\t\t\t\t\t) > 0.001
+\t\t\t\t\t\t}
+\t\t\t\t\t\tonToggle={toggleVideoBeautify}
+\t\t\t\t\t\tonStrengthChange={(value) => {
+\t\t\t\t\t\t\tsetBeautifyStrength(clamp({ value, min: 0, max: 1 }));
+\t\t\t\t\t\t}}
+\t\t\t\t\t\tonApply={() => {
+\t\t\t\t\t\t\tvoid runVideoBeautify();
+\t\t\t\t\t\t}}
+\t\t\t\t\t/>
+\t\t\t\t) : null}
+
+'''
+
+if "VocalBeautifyRow" not in _vp:
+    _vp = _vp.replace(
+        'import { useReducer, useRef } from "react";',
+        'import { useEffect, useReducer, useRef, useState } from "react";',
+        1,
+    )
+    _vp = _vp.replace(
+        'import { formatSpeedLabel } from "@/lib/timeline/speed-utils";',
+        'import { formatSpeedLabel } from "@/lib/timeline/speed-utils";\n'
+        'import { probeMediaHasAudio } from "@/lib/media/audio-probe";\n'
+        'import {\n\tapplyVocalBeautify,\n\tdescribeVocalBeautify,\n} from "@/lib/audio/vocal-beautify";\n'
+        'import { VocalBeautifyRow } from "./vocal-beautify-row";',
+        1,
+    )
+    _vp = _vp.replace(
+        "\tconst [, forceRender] = useReducer((x: number) => x + 1, 0);",
+        "\tconst [, forceRender] = useReducer((x: number) => x + 1, 0);\n" + VIDEO_HANDLER,
+        1,
+    )
+    _vp_marker = "\t\t\t\t</PanelBaseView>"
+    _vp_index = _vp.rfind(_vp_marker)
+    if _vp_index == -1:
+        raise SystemExit(f"panel view marker not found in {VIDEO_PANEL}")
+    _vp = _vp[:_vp_index] + VIDEO_CARD + _vp[_vp_index:]
+    VIDEO_PANEL.write_text(_vp, encoding="utf-8")
+    print(f"  patched {VIDEO_PANEL.relative_to(ROOT)} (视频人声美化)")
+
+
+# ------------------------- 视频片段：分离音频（muted）后不再画波形
+TIMELINE_ELEMENT = SRC / "components" / "editor" / "panels" / "timeline" / "timeline-element.tsx"
+_te = TIMELINE_ELEMENT.read_text(encoding="utf-8")
+
+if "beautifiedFile" not in _te:
+    _te = _te.replace(
+        '\tif (mediaAsset.type === "video" && mediaAsset.file) {\n'
+        "\t\tconst trackHeight = getTrackHeight({ type: track.type });",
+        '\tif (element.type === "video" && mediaAsset.type === "video" && mediaAsset.file) {\n'
+        "\t\t// 勾了人声美化时，波形画处理后的音频，跟听到的一致\n"
+        "\t\tconst beautifiedAsset =\n"
+        "\t\t\telement.voiceBeautifyEnabled && element.voiceBeautifyMediaId\n"
+        "\t\t\t\t? mediaAssets.find((asset) => asset.id === element.voiceBeautifyMediaId)\n"
+        "\t\t\t\t: undefined;\n"
+        "\t\tconst beautifiedFile = beautifiedAsset?.file ?? null;\n"
+        "\t\tconst trackHeight = getTrackHeight({ type: track.type });",
+        1,
+    )
+    _te = _te.replace(
+        "\t\t\t\t{/* 波形按 2 倍高度渲染，容器只露上半部分 → 只显示上半边 */}\n"
+        '\t\t\t\t<div className="relative shrink-0 overflow-hidden" style={{ height: bandHeight }}>\n'
+        '\t\t\t\t\t<div className="absolute inset-x-0 top-0" style={{ height: bandHeight * 2 }}>\n'
+        "\t\t\t\t\t\t<AudioWaveform\n"
+        "\t\t\t\t\t\t\taudioBlob={mediaAsset.file}",
+        "\t\t\t\t{/* 波形按 2 倍高度渲染，容器只露上半部分；分离音频 / 静音后不画 */}\n"
+        '\t\t\t\t<div className="relative shrink-0 overflow-hidden" style={{ height: bandHeight }}>\n'
+        "\t\t\t\t\t{element.muted ? (\n"
+        '\t\t\t\t\t\t<span className="text-muted-foreground/70 flex h-full items-start pl-1.5 text-[9px] leading-tight">\n'
+        "\t\t\t\t\t\t\t静音\n"
+        "\t\t\t\t\t\t</span>\n"
+        "\t\t\t\t\t) : (\n"
+        '\t\t\t\t\t\t<div className="absolute inset-x-0 top-0" style={{ height: bandHeight * 2 }}>\n'
+        "\t\t\t\t\t\t\t<AudioWaveform\n"
+        "\t\t\t\t\t\t\t\taudioBlob={beautifiedFile ?? mediaAsset.file}",
+        1,
+    )
+    _te = _te.replace(
+        "\t\t\t\t\t\t\tduration={element.duration}\n"
+        "\t\t\t\t\t\t\theight={bandHeight * 2}\n"
+        '\t\t\t\t\t\t\tclassName="w-full"\n'
+        "\t\t\t\t\t\t/>\n"
+        "\t\t\t\t\t</div>\n"
+        "\t\t\t\t</div>",
+        "\t\t\t\t\t\t\t\tduration={element.duration}\n"
+        "\t\t\t\t\t\t\t\theight={bandHeight * 2}\n"
+        '\t\t\t\t\t\t\t\tclassName="w-full"\n'
+        "\t\t\t\t\t\t\t/>\n"
+        "\t\t\t\t\t\t</div>\n"
+        "\t\t\t\t\t)}\n"
+        "\t\t\t\t</div>",
+        1,
+    )
+    if (
+        "beautifiedFile" not in _te
+        or 'element.type === "video" && mediaAsset.type === "video"' not in _te
+        or "element.muted ? (" not in _te
+    ):
+        raise SystemExit(f"波形补丁没打上：{TIMELINE_ELEMENT}")
+    TIMELINE_ELEMENT.write_text(_te, encoding="utf-8")
+    print(f"  patched {TIMELINE_ELEMENT.relative_to(ROOT)} (分离音频后不画波形)")
+
+
+# ------------------- 预览/客户端导出：视频勾了人声美化就用处理后的音频
+AUDIO_LIB = SRC / "lib" / "media" / "audio.ts"
+_al = AUDIO_LIB.read_text(encoding="utf-8")
+
+if "resolveElementAudioAsset" not in _al:
+    _al = _al.replace(
+        "function collectMediaAudioClip({",
+        """/**
+ * 元素实际要出声的素材：视频勾了人声美化时，用处理后的 wav 取代画面自带音轨。
+ */
+export function resolveElementAudioAsset({
+\telement,
+\tmediaMap,
+}: {
+\telement: {
+\t\tmediaId?: string;
+\t\ttype?: string;
+\t\tvoiceBeautifyEnabled?: boolean;
+\t\tvoiceBeautifyMediaId?: string;
+\t};
+\tmediaMap: Map<string, MediaAsset>;
+}): MediaAsset | undefined {
+\tconst mediaAsset = element.mediaId ? mediaMap.get(element.mediaId) : undefined;
+\tif (!mediaAsset) return undefined;
+\tif (element.type === "video" && element.voiceBeautifyEnabled) {
+\t\tconst beautified = element.voiceBeautifyMediaId
+\t\t\t? mediaMap.get(element.voiceBeautifyMediaId)
+\t\t\t: undefined;
+\t\tif (beautified) return beautified;
+\t}
+\treturn mediaAsset;
+}
+
+function collectMediaAudioClip({""",
+        1,
+    )
+    _video_old = (
+        '\t\t\tif (element.type === "video") {\n'
+        "\t\t\t\tconst mediaAsset = mediaMap.get(element.mediaId);\n"
+        "\t\t\t\tif (!mediaAsset) continue;"
+    )
+    _video_new = (
+        '\t\t\tif (element.type === "video") {\n'
+        "\t\t\t\tconst mediaAsset = resolveElementAudioAsset({ element, mediaMap });\n"
+        "\t\t\t\tif (!mediaAsset) continue;"
+    )
+    _al = _al.replace(_video_old, _video_new)
+    if _al.count("resolveElementAudioAsset({ element, mediaMap })") != 2:
+        raise SystemExit(f"视频音轨替换没打全：{AUDIO_LIB}")
+    AUDIO_LIB.write_text(_al, encoding="utf-8")
+    print(f"  patched {AUDIO_LIB.relative_to(ROOT)} (视频用人声美化后的音轨)")
+
+
+# ------------------------------ 预览：原生 <video> 播放 + DOM 字幕/贴纸悬浮层
+# 原来的预览是「每帧把 1080p 画面 drawImage 进 canvas」的实时合成：
+# 视频解码一帧 → 拷进 canvas → 再交给合成器，GPU/CPU 都在跑满。
+# 现在：视频/图片用原生 <video>/<img> 按变换摆好，浏览器自己播；
+# 字幕仍用 TextNode 绘制（像素与原来一致），但只画一张静态位图、内容变了才重画；
+# 贴纸是 <img>。等于「播放器照常播放，字幕浮在上面」。
+PREVIEW_DOM_LAYERS = (
+    SRC / "components" / "editor" / "panels" / "preview" / "preview-dom-layers.tsx"
+)
+PREVIEW_DOM_LAYERS_SOURCE = tabsify(
+    """
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEditor } from "@/hooks/use-editor";
+
+import { getVisualSourceTime } from "@/lib/timeline/element-utils";
+import { isBottomAlignedSubtitleText } from "@/lib/timeline/text-utils";
+import { DEFAULT_BLUR_INTENSITY } from "@/constants/project-constants";
+import type { CanvasRenderer } from "@/services/renderer/canvas-renderer";
+import { TextNode } from "@/services/renderer/nodes/text-node";
+import type { MediaAsset } from "@/types/assets";
+import type { TBackground, TCanvasSize } from "@/types/project";
+import type {
+  ImageElement,
+  StickerElement,
+  TextElement,
+  TimelineElement,
+  TimelineTrack,
+  VideoElement,
+} from "@/types/timeline";
+
+const EPSILON = 1 / 1000;
+
+type VisualElement = VideoElement | ImageElement;
+
+type ActiveElements = {
+  visuals: VisualElement[];
+  stickers: StickerElement[];
+  texts: TextElement[];
+};
+
+function isActive({
+  element,
+  time,
+}: {
+  element: TimelineElement;
+  time: number;
+}): boolean {
+  return (
+    time >= element.startTime - EPSILON &&
+    time < element.startTime + element.duration - EPSILON
+  );
+}
+
+function collectActive({
+  tracks,
+  time,
+}: {
+  tracks: TimelineTrack[];
+  time: number;
+}): ActiveElements {
+  const visuals: VisualElement[] = [];
+  const stickers: StickerElement[] = [];
+  const texts: TextElement[] = [];
+
+  for (const track of tracks) {
+    if ("hidden" in track && track.hidden) continue;
+    for (const element of track.elements) {
+      if ("hidden" in element && element.hidden) continue;
+      if (!isActive({ element, time })) continue;
+      if (element.type === "video" || element.type === "image") {
+        visuals.push(element);
+      }
+      if (element.type === "sticker") stickers.push(element);
+      if (element.type === "text") texts.push(element);
+    }
+  }
+
+  return { visuals, stickers, texts };
+}
+
+/** 和 VisualNode.renderVisual 同一套算法：contain 缩放后再乘 transform.scale。 */
+function visualBox({
+  element,
+  sourceWidth,
+  sourceHeight,
+  canvasSize,
+  fitCanvasSize,
+}: {
+  element: VisualElement | StickerElement;
+  sourceWidth: number;
+  sourceHeight: number;
+  canvasSize: TCanvasSize;
+  fitCanvasSize: TCanvasSize;
+}) {
+  const containScale = Math.min(
+    fitCanvasSize.width / sourceWidth,
+    fitCanvasSize.height / sourceHeight,
+  );
+  const width = sourceWidth * containScale * element.transform.scale;
+  const height = sourceHeight * containScale * element.transform.scale;
+  return {
+    left: canvasSize.width / 2 + element.transform.position.x - width / 2,
+    top: canvasSize.height / 2 + element.transform.position.y - height / 2,
+    width,
+    height,
+  };
+}
+
+/** 画布单位 → 屏幕像素：直接按显示尺寸排版，避免多一张 1080p 缩放层。 */
+function layerStyle({
+  element,
+  box,
+  scale,
+}: {
+  element: VisualElement | StickerElement;
+  box: { left: number; top: number; width: number; height: number };
+  scale: number;
+}) {
+  const flipX = element.transform.flipX ? -1 : 1;
+  const flipY = element.transform.flipY ? -1 : 1;
+  const rotate = element.transform.rotate ?? 0;
+  return {
+    position: "absolute" as const,
+    left: box.left * scale,
+    top: box.top * scale,
+    width: box.width * scale,
+    height: box.height * scale,
+    opacity: element.opacity,
+    transform: `rotate(${rotate}deg) scale(${flipX}, ${flipY})`,
+    transformOrigin: "center",
+    pointerEvents: "none" as const,
+  };
+}
+
+function VideoLayer({
+  element,
+  media,
+  canvasSize,
+  fitCanvasSize,
+  scale,
+  registerVideo,
+}: {
+  element: VideoElement;
+  media: MediaAsset;
+  canvasSize: TCanvasSize;
+  fitCanvasSize: TCanvasSize;
+  scale: number;
+  registerVideo: (args: {
+    id: string;
+    element: VideoElement;
+    video: HTMLVideoElement | null;
+  }) => void;
+}) {
+  const editor = useEditor();
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const rate = element.playbackRate ?? 1;
+  const reversed = element.reversed ?? false;
+  const box = visualBox({
+    element,
+    sourceWidth: media.width ?? canvasSize.width,
+    sourceHeight: media.height ?? canvasSize.height,
+    canvasSize,
+    fitCanvasSize,
+  });
+
+  // 登记这个视频：播放时钟以它为准，字幕就不会跟着卡住
+  useEffect(() => {
+    const video = videoRef.current;
+    registerVideo({ id: element.id, element, video });
+    if (!video) return;
+    const notify = () => {
+      window.dispatchEvent(new CustomEvent("playback-update"));
+    };
+    const events = [
+      "timeupdate",
+      "seeking",
+      "seeked",
+      "play",
+      "pause",
+      "ratechange",
+    ];
+    for (const name of events) video.addEventListener(name, notify);
+    return () => {
+      for (const name of events) video.removeEventListener(name, notify);
+      registerVideo({ id: element.id, element, video: null });
+    };
+  }, [element, registerVideo]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    let frame = 0;
+    let lastAppTime = -1;
+
+    // 浏览器自己解码播放，这里只做「对表」：跑偏了才校正，不逐帧搬图。
+    const tick = () => {
+      const playing = editor.playback.getIsPlaying();
+      const appTime = editor.playback.getCurrentTime();
+      // app 时钟是 rAF 推的，被浏览器限流时会原地不动；
+      // 那种情况下不要把视频拽回去，让它自己播。
+      const appAdvancing = Math.abs(appTime - lastAppTime) > 1e-4;
+      lastAppTime = appTime;
+
+      const target = getVisualSourceTime({
+        timelineTime: appTime,
+        startTime: element.startTime,
+        duration: element.duration,
+        trimStart: element.trimStart,
+        playbackRate: rate,
+        reversed,
+      });
+      const mediaDuration = Number.isFinite(video.duration) ? video.duration : 0;
+      const clamped =
+        mediaDuration > 0
+          ? Math.min(Math.max(target, 0), Math.max(mediaDuration - 0.05, 0))
+          : Math.max(target, 0);
+
+      if (Math.abs(video.playbackRate - rate) > 0.001) {
+        video.playbackRate = rate;
+      }
+
+      if (playing && !reversed) {
+        if (video.paused) void video.play().catch(() => {});
+        if (appAdvancing && Math.abs(video.currentTime - clamped) > 0.35) {
+          video.currentTime = clamped;
+        }
+      } else {
+        if (!video.paused) video.pause();
+        if (Math.abs(video.currentTime - clamped) > 0.02) {
+          video.currentTime = clamped;
+        }
+      }
+
+      frame = requestAnimationFrame(tick);
+    };
+
+    tick();
+    return () => cancelAnimationFrame(frame);
+  }, [
+    editor,
+    element.startTime,
+    element.duration,
+    element.trimStart,
+    rate,
+    reversed,
+  ]);
+
+  return (
+    // 静音：声音走 AudioManager（Sonic 变速不变调那条链路），这里只出画面
+    <video
+      ref={videoRef}
+      src={media.url}
+      muted
+      playsInline
+      preload="auto"
+      disablePictureInPicture
+      style={{ ...layerStyle({ element, box, scale }), objectFit: "fill" }}
+    />
+  );
+}
+
+function ImageLayer({
+  element,
+  media,
+  canvasSize,
+  fitCanvasSize,
+  scale,
+}: {
+  element: ImageElement;
+  media: MediaAsset;
+  canvasSize: TCanvasSize;
+  fitCanvasSize: TCanvasSize;
+  scale: number;
+}) {
+  const box = visualBox({
+    element,
+    sourceWidth: media.width ?? canvasSize.width,
+    sourceHeight: media.height ?? canvasSize.height,
+    canvasSize,
+    fitCanvasSize,
+  });
+
+  // biome-ignore lint/performance/noImgElement: 预览层直接用 blob URL
+  return (
+    <img
+      src={media.url}
+      alt={media.name}
+      draggable={false}
+      style={{ ...layerStyle({ element, box, scale }), objectFit: "fill" }}
+    />
+  );
+}
+
+function StickerLayer({
+  element,
+  canvasSize,
+  scale,
+}: {
+  element: StickerElement;
+  canvasSize: TCanvasSize;
+  scale: number;
+}) {
+  const box = visualBox({
+    element,
+    sourceWidth: 200,
+    sourceHeight: 200,
+    canvasSize,
+    fitCanvasSize: canvasSize,
+  });
+  const color = element.color
+    ? `&color=${encodeURIComponent(element.color)}`
+    : "";
+  const src = `https://api.iconify.design/${element.iconName}.svg?width=200&height=200${color}`;
+
+  // biome-ignore lint/performance/noImgElement: 贴纸就是图标 SVG
+  return (
+    <img
+      src={src}
+      alt={element.iconName}
+      draggable={false}
+      style={{ ...layerStyle({ element, box, scale }), objectFit: "fill" }}
+    />
+  );
+}
+
+function BlurBackdropLayer({
+  media,
+  canvasSize,
+  blurIntensity,
+  scale,
+}: {
+  media: MediaAsset;
+  canvasSize: TCanvasSize;
+  blurIntensity: number;
+  scale: number;
+}) {
+  const src = media.type === "image" ? media.url : media.thumbnailUrl;
+  if (!src) return null;
+
+  // biome-ignore lint/performance/noImgElement: 背景层直接用 blob URL
+  return (
+    <img
+      src={src}
+      alt=""
+      aria-hidden
+      draggable={false}
+      style={{
+        position: "absolute",
+        left: 0,
+        top: 0,
+        width: canvasSize.width * scale,
+        height: canvasSize.height * scale,
+        objectFit: "cover",
+        filter: `blur(${blurIntensity * scale}px)`,
+        transform: "scale(1.4)",
+        transformOrigin: "center",
+        pointerEvents: "none",
+      }}
+    />
+  );
+}
+
+function TextLayer({
+  texts,
+  canvasSize,
+  scale,
+}: {
+  texts: TextElement[];
+  canvasSize: TCanvasSize;
+  scale: number;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const signature = useMemo(
+    () =>
+      JSON.stringify(
+        texts.map((element) => [
+          element.id,
+          element.content,
+          element.fontSize,
+          element.fontFamily,
+          element.fontWeight,
+          element.fontStyle,
+          element.color,
+          element.backgroundColor,
+          element.backgroundOpacity,
+          element.backgroundPaddingX,
+          element.backgroundPaddingY,
+          element.backgroundBorderRadius,
+          element.boxWidth,
+          element.textAlign,
+          element.stroke,
+          element.shadow,
+          element.opacity,
+          element.transform,
+        ]),
+      ),
+    [texts],
+  );
+
+  useEffect(() => {
+    const target = canvasRef.current;
+    if (!target) return;
+    const context = target.getContext("2d");
+    if (!context) return;
+    context.clearRect(0, 0, target.width, target.height);
+    if (texts.length === 0) return;
+
+    // 还是用原来那套 TextNode 画（像素和 canvas 预览一致），
+    // 但直接画进这一张静态画布：不建中转 canvas、不搬 1080p 位图，
+    // 只在字幕内容/样式变化时重画一次。
+    const renderer = {
+      context,
+      width: canvasSize.width,
+      height: canvasSize.height,
+      fps: 30,
+    } as unknown as CanvasRenderer;
+
+    for (const element of texts) {
+      const node = new TextNode({
+        ...element,
+        canvasCenter: {
+          x: canvasSize.width / 2,
+          y: canvasSize.height / 2,
+        },
+        canvasHeight: canvasSize.height,
+        canvasWidth: canvasSize.width,
+        textBaseline: isBottomAlignedSubtitleText({ element })
+          ? "bottom"
+          : "middle",
+      });
+      void node.render({ renderer, time: element.startTime });
+    }
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signature, canvasSize.width, canvasSize.height]);
+
+  // 没有字幕就别挂这张画布，少一个合成层
+  if (texts.length === 0) return null;
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={canvasSize.width}
+      height={canvasSize.height}
+      style={{
+        position: "absolute",
+        left: 0,
+        top: 0,
+        width: canvasSize.width * scale,
+        height: canvasSize.height * scale,
+        pointerEvents: "none",
+      }}
+    />
+  );
+}
+
+export function PreviewDomLayers({
+  canvasSize,
+  displaySize,
+}: {
+  canvasSize: TCanvasSize;
+  displaySize: { width: number; height: number };
+}) {
+  const editor = useEditor();
+  const tracks = editor.timeline.getTracks();
+  const mediaAssets = editor.media.getAssets();
+  const activeProject = editor.project.getActive();
+  const background: TBackground = activeProject.settings.background;
+  const fitCanvasSize = activeProject.settings.originalCanvasSize ?? canvasSize;
+
+  const mediaMap = useMemo(
+    () => new Map(mediaAssets.map((asset) => [asset.id, asset])),
+    [mediaAssets],
+  );
+
+  const scale =
+    canvasSize.width > 0 ? displaySize.width / canvasSize.width : 1;
+  const [time, setTime] = useState(() => editor.playback.getCurrentTime());
+  const signatureRef = useRef("");
+  // 正在播的视频元素：播放时钟以它为准（app 的时钟是 rAF 推的，
+  // 浏览器一限流 rAF 就会停住，而 <video> 自己还在播 → 字幕会卡住不动）
+  const playingVideos = useRef(
+    new Map<string, { element: VideoElement; video: HTMLVideoElement }>(),
+  );
+
+  const registerVideo = useCallback(
+    ({
+      id,
+      element,
+      video,
+    }: {
+      id: string;
+      element: VideoElement;
+      video: HTMLVideoElement | null;
+    }) => {
+      if (!video) {
+        playingVideos.current.delete(id);
+        return;
+      }
+      playingVideos.current.set(id, { element, video });
+    },
+    [],
+  );
+
+  /** 视频自己的播放位置换算回时间线时间（变速片段要除速率）。 */
+  const timelineTimeFromVideos = (): number | null => {
+    for (const { element, video } of playingVideos.current.values()) {
+      if (video.paused || !Number.isFinite(video.currentTime)) continue;
+      if (element.reversed) continue;
+      const rate = element.playbackRate ?? 1;
+      const mapped =
+        element.startTime + (video.currentTime - element.trimStart) / rate;
+      if (
+        mapped >= element.startTime - 0.05 &&
+        mapped <= element.startTime + element.duration + 0.05
+      ) {
+        return mapped;
+      }
+    }
+    return null;
+  };
+
+  /** 让 <video> 的播放/暂停、暂停时的画面位置跟 app 状态一致。
+   *  放在定时器/事件里跑，而不是只在 rAF 里跑：rAF 被限流时按播放也能起来。 */
+  const syncVideos = () => {
+    const playing = editor.playback.getIsPlaying();
+    const appTime = editor.playback.getCurrentTime();
+    for (const { element, video } of playingVideos.current.values()) {
+      const shouldPlay = playing && !element.reversed;
+      if (shouldPlay) {
+        if (video.paused && !video.ended) void video.play().catch(() => {});
+        continue;
+      }
+      if (!video.paused) video.pause();
+      const target = getVisualSourceTime({
+        timelineTime: appTime,
+        startTime: element.startTime,
+        duration: element.duration,
+        trimStart: element.trimStart,
+        playbackRate: element.playbackRate ?? 1,
+        reversed: element.reversed ?? false,
+      });
+      if (
+        Number.isFinite(target) &&
+        Math.abs(video.currentTime - target) > 0.05
+      ) {
+        video.currentTime = Math.max(target, 0);
+      }
+    }
+  };
+
+  const currentDisplayTime = (): number => {
+    if (editor.playback.getIsPlaying()) {
+      const fromVideo = timelineTimeFromVideos();
+      if (fromVideo !== null) return fromVideo;
+    }
+    return editor.playback.getCurrentTime();
+  };
+
+  // 只有「可见元素集合变化」或「暂停时时间变化（拖播放头）」才重渲染。
+  // 用 150ms 定时器 + 各种事件驱动，而不是 rAF：rAF 被浏览器限流时
+  // 视频还在播，字幕不能跟着卡死。
+  useEffect(() => {
+    const sync = () => {
+      syncVideos();
+      const now = currentDisplayTime();
+      const playing = editor.playback.getIsPlaying();
+      const active = collectActive({ tracks, time: now });
+      const ids = [
+        ...active.visuals.map((element) => element.id),
+        ...active.stickers.map((element) => element.id),
+        ...active.texts.map((element) => element.id),
+      ].join(",");
+      const signature = playing ? `p|${ids}` : `s|${ids}|${Math.round(now * 30)}`;
+      if (signature !== signatureRef.current) {
+        signatureRef.current = signature;
+        setTime(now);
+      }
+    };
+
+    sync();
+    const timer = window.setInterval(sync, 150);
+    window.addEventListener("playback-update", sync);
+    window.addEventListener("playback-seek", sync);
+    document.addEventListener("pointerdown", sync);
+    document.addEventListener("pointerup", sync);
+    document.addEventListener("pointermove", sync);
+    document.addEventListener("keydown", sync);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("playback-update", sync);
+      window.removeEventListener("playback-seek", sync);
+      document.removeEventListener("pointerdown", sync);
+      document.removeEventListener("pointerup", sync);
+      document.removeEventListener("pointermove", sync);
+      document.removeEventListener("keydown", sync);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor, tracks]);
+
+  const active = collectActive({ tracks, time });
+  const blurIntensity =
+    background.type === "blur"
+      ? background.blurIntensity
+      : DEFAULT_BLUR_INTENSITY;
+
+  return (
+    <div
+      className="absolute inset-0 overflow-hidden"
+      style={{
+        background: background.type === "color" ? background.color : "black",
+      }}
+    >
+      <div
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          width: displaySize.width,
+          height: displaySize.height,
+        }}
+      >
+        {background.type === "blur"
+          ? active.visuals.map((element) => {
+              const media = mediaMap.get(element.mediaId);
+              if (!media) return null;
+              return (
+                <BlurBackdropLayer
+                  key={`blur-${element.id}`}
+                  media={media}
+                  canvasSize={canvasSize}
+                  blurIntensity={blurIntensity}
+                  scale={scale}
+                />
+              );
+            })
+          : null}
+
+        {active.visuals.map((element) => {
+          const media = mediaMap.get(element.mediaId);
+          if (!media) return null;
+          if (element.type === "video") {
+            return (
+              <VideoLayer
+                key={element.id}
+                element={element}
+                media={media}
+                canvasSize={canvasSize}
+                fitCanvasSize={fitCanvasSize}
+                scale={scale}
+                registerVideo={registerVideo}
+              />
+            );
+          }
+          return (
+            <ImageLayer
+              key={element.id}
+              element={element}
+              media={media}
+              canvasSize={canvasSize}
+              fitCanvasSize={fitCanvasSize}
+              scale={scale}
+            />
+          );
+        })}
+
+        {active.stickers.map((element) => (
+          <StickerLayer
+            key={element.id}
+            element={element}
+            canvasSize={canvasSize}
+            scale={scale}
+          />
+        ))}
+
+        <TextLayer texts={active.texts} canvasSize={canvasSize} scale={scale} />
+      </div>
+    </div>
+  );
+}
+"""
+)
+
+PREVIEW_DOM_LAYERS.write_text(PREVIEW_DOM_LAYERS_SOURCE + "\n", encoding="utf-8")
+print(f"  wrote {PREVIEW_DOM_LAYERS.relative_to(ROOT)} (DOM 预览层)")
+
+
+# 预览面板：把每帧 canvas 合成换成 DOM 层
+PREVIEW_PANEL_FILE = (
+    SRC / "components" / "editor" / "panels" / "preview" / "index.tsx"
+)
+_pp = PREVIEW_PANEL_FILE.read_text(encoding="utf-8")
+
+if "PreviewDomLayers" not in _pp:
+    _pp = _pp.replace(
+        'import { useCallback, useEffect, useMemo, useRef } from "react";',
+        'import { useEffect, useMemo, useRef } from "react";',
+        1,
+    )
+    _pp = _pp.replace(
+        'import { useRafLoop } from "@/hooks/use-raf-loop";' + chr(10),
+        "",
+        1,
+    )
+    _pp = _pp.replace(
+        'import type { RootNode } from "@/services/renderer/nodes/root-node";' + chr(10),
+        "",
+        1,
+    )
+    _pp = _pp.replace(
+        'import { formatTimeCode, getLastFrameTime } from "@/lib/time";',
+        'import { formatTimeCode } from "@/lib/time";' + chr(10)
+        + 'import { PreviewDomLayers } from "./preview-dom-layers";',
+        1,
+    )
+
+    PREVIEW_CANVAS_SOURCE = tabsify(
+        """
+function PreviewCanvas() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const { width: nativeWidth, height: nativeHeight } = usePreviewSize();
+  const containerSize = useContainerSize({ containerRef });
+  const editor = useEditor();
+  const activeProject = editor.project.getActive();
+
+  const displaySize = useMemo(() => {
+    if (
+      !nativeWidth ||
+      !nativeHeight ||
+      containerSize.width === 0 ||
+      containerSize.height === 0
+    ) {
+      return { width: nativeWidth ?? 0, height: nativeHeight ?? 0 };
+    }
+
+    const paddingBuffer = 4;
+    const availableWidth = containerSize.width - paddingBuffer;
+    const availableHeight = containerSize.height - paddingBuffer;
+
+    const aspectRatio = nativeWidth / nativeHeight;
+    const containerAspect = availableWidth / availableHeight;
+
+    const displayWidth =
+      containerAspect > aspectRatio
+        ? availableHeight * aspectRatio
+        : availableWidth;
+    const displayHeight =
+      containerAspect > aspectRatio
+        ? availableHeight
+        : availableWidth / aspectRatio;
+
+    return { width: displayWidth, height: displayHeight };
+  }, [nativeWidth, nativeHeight, containerSize.width, containerSize.height]);
+
+  return (
+    <div
+      ref={containerRef}
+      className="relative flex h-full w-full items-center justify-center"
+    >
+      <div
+        className="relative overflow-hidden border"
+        style={{
+          width: displaySize.width,
+          height: displaySize.height,
+          background:
+            activeProject.settings.background.type === "blur"
+              ? "transparent"
+              : activeProject?.settings.background.color,
+        }}
+      >
+        {/* 原生视频 + DOM 字幕/贴纸：浏览器自己播，不再每帧重合成 */}
+        <PreviewDomLayers
+          canvasSize={{ width: nativeWidth, height: nativeHeight }}
+          displaySize={displaySize}
+        />
+        {/* 只给交互层量尺寸用，不画东西 */}
+        <canvas
+          ref={canvasRef}
+          width={nativeWidth}
+          height={nativeHeight}
+          className="pointer-events-none absolute inset-0 invisible"
+          style={{ width: displaySize.width, height: displaySize.height }}
+        />
+        <PreviewInteractionOverlay
+          canvasRef={canvasRef}
+          displaySize={displaySize}
+        />
+      </div>
+    </div>
+  );
+}
+"""
+    )
+
+    _marker = "function PreviewCanvas() {"
+    _index = _pp.find(_marker)
+    if _index == -1:
+        raise SystemExit(f"PreviewCanvas 不在 {PREVIEW_PANEL_FILE}")
+    _pp = _pp[:_index] + PREVIEW_CANVAS_SOURCE + chr(10)
+    PREVIEW_PANEL_FILE.write_text(_pp, encoding="utf-8")
+    print(f"  patched {PREVIEW_PANEL_FILE.relative_to(ROOT)} (预览改 DOM 层)")
+
+
+# ------------------------------------------- 片段配色 / 相邻缝隙 / 裁剪伸缩
+def T(levels: int) -> str:
+    return TAB * levels
+
+
+def patch_text(path: Path, marker: str, edits) -> None:
+    """按「精确文本 + 预期次数」打补丁；锚点不对就报错，不静默失败。"""
+    text = path.read_text(encoding="utf-8")
+    if marker in text:
+        print(f"  keep    {path.relative_to(ROOT)}")
+        return
+    for old, new, expect in edits:
+        count = text.count(old)
+        if count != expect:
+            raise SystemExit(
+                f"{path.relative_to(ROOT)}: anchor {old[:70]!r} expected {expect}, got {count}"
+            )
+        text = text.replace(old, new)
+    if marker not in text:
+        raise SystemExit(f"{path.relative_to(ROOT)}: marker not applied: {marker}")
+    path.write_text(text, encoding="utf-8")
+    print(f"  patched {path.relative_to(ROOT)}")
+
+
+# 1) 配色：视频片段青色、音频绿色、字幕橙色
+TRACK_CONSTANTS = SRC / "constants" / "timeline-constants.tsx"
+patch_text(
+    TRACK_CONSTANTS,
+    "bg-[#12A5A5]",
+    [
+        ('background: "transparent",', 'background: "bg-[#12A5A5]",', 1),
+        ('background: "bg-[#915DBE]",', 'background: "bg-[#2E9E5B]",', 1),
+        ('background: "bg-[#5DBAA0]",', 'background: "bg-[#E08A38]",', 1),
+    ],
+)
+
+
+# 2) 同轨相邻片段之间留一条缝（视觉缝，不动时间）
+TIMELINE_ELEMENT_ADJACENT = (
+    SRC / "components" / "editor" / "panels" / "timeline" / "timeline-element.tsx"
+)
+_adjacent_block = (
+    T(1) + "// 同轨紧邻的下一段：两段之间画一条缝，边界一眼能看出来" + NL
+    + T(1) + "// 用显示中的时间算，拖动/缩放时缝隙也不会错位" + NL
+    + T(1) + "const adjacentNextElement = track.elements.find(" + NL
+    + T(2) + "(candidate) =>" + NL
+    + T(3) + "candidate.id !== element.id &&" + NL
+    + T(3) + "Math.abs(" + NL
+    + T(4) + "candidate.startTime - (displayedStartTime + displayedDuration)," + NL
+    + T(3) + ") < 0.08," + NL
+    + T(1) + ");"
+)
+_border_old = (
+    T(6) + "left: `${elementLeft}px`," + NL
+    + T(6) + "width: `${elementWidth}px`,"
+)
+_border_new = (
+    T(6) + "left: `${elementLeft}px`," + NL
+    + T(6) + "width: `${elementWidth}px`," + NL
+    + T(6) + "// 与下一段之间留 2px 缝（border 走 border-box，不吃时间）" + NL
+    + T(6) + "borderRight: adjacentNextElement" + NL
+    + T(7) + '? "2px solid rgba(0, 0, 0, 0.85)"' + NL
+    + T(7) + ": undefined,"
+)
+patch_text(
+    TIMELINE_ELEMENT_ADJACENT,
+    "adjacentNextElement",
+    [
+        (
+            T(1) + "const isMuted = canElementHaveAudio(element) && element.muted === true;",
+            T(1) + "const isMuted = canElementHaveAudio(element) && element.muted === true;" + NL + _adjacent_block,
+            1,
+        ),
+        (_border_old, _border_new, 1),
+    ],
+)
+
+
+# 3) 裁剪伸缩：上限用「素材真实长度」，且左扩不会把内容错位
+RESIZE_HOOK = SRC / "hooks" / "timeline" / "element" / "use-element-resize.ts"
+
+_source_media_block = (
+    T(1) + "// 片段能延伸到的上限是「素材本身有多长」，不是「这段保留了多少」" + NL
+    + T(1) + "const sourceMediaDuration = useMemo(() => {" + NL
+    + T(2) + 'if (element.type !== "video" && element.type !== "audio") {' + NL
+    + T(3) + "return Number.POSITIVE_INFINITY;" + NL
+    + T(2) + "}" + NL
+    + T(2) + 'if (!("mediaId" in element)) return Number.POSITIVE_INFINITY;' + NL
+    + T(2) + "const mediaId = (element as { mediaId: string }).mediaId;" + NL
+    + T(2) + "const asset = editor.media.getAssets().find((item) => item.id === mediaId);" + NL
+    + T(2) + "const duration = asset?.duration;" + NL
+    + T(2) + 'return typeof duration === "number" && duration > 0' + NL
+    + T(3) + "? duration" + NL
+    + T(3) + ": Number.POSITIVE_INFINITY;" + NL
+    + T(1) + "}, [editor, element]);"
+)
+
+
+def _source_duration_new(indent: int) -> str:
+    return (
+        T(indent) + "const keptSourceDuration =" + NL
+        + T(indent + 1) + "resizing.initialTrimStart +" + NL
+        + T(indent + 1) + "resizing.initialDuration * rate +" + NL
+        + T(indent + 1) + "resizing.initialTrimEnd;" + NL
+        + T(indent) + "// 以素材真实长度为准：每段都能扩到整条素材" + NL
+        + T(indent) + "const sourceDuration = Number.isFinite(sourceMediaDuration)" + NL
+        + T(indent + 1) + "? Math.max(sourceMediaDuration, keptSourceDuration)" + NL
+        + T(indent + 1) + ": keptSourceDuration;"
+    )
+
+
+_source_duration_old = (
+    T(3) + "const sourceDuration =" + NL
+    + T(4) + "resizing.initialTrimStart +" + NL
+    + T(4) + "resizing.initialDuration * rate +" + NL
+    + T(4) + "resizing.initialTrimEnd;"
+)
+
+_left_old = (
+    T(4) + "const sourceTrimDelta = newTrimStart - resizing.initialTrimStart;" + NL
+    + T(4) + "const timelineDelta = sourceTrimDelta / rate;"
+)
+_left_new = (
+    T(4) + "const rawTrimDelta = newTrimStart - resizing.initialTrimStart;" + NL
+    + T(4) + "// 时间线不能出现负起点：左扩到 0 就停，别只减 trimStart（否则画面整体错位）" + NL
+    + T(4) + "const timelineDelta = Math.max(rawTrimDelta / rate, -resizing.initialStartTime);" + NL
+    + T(4) + "const appliedTrimStart = resizing.initialTrimStart + timelineDelta * rate;"
+)
+
+_right_old = (
+    T(4) + "} else {" + NL
+    + T(5) + "const newDuration = snapTimeToFrame({" + NL
+    + T(6) + "time: resizing.initialDuration + resizing.initialTrimEnd / rate," + NL
+    + T(6) + "fps: projectFps," + NL
+    + T(5) + "});"
+)
+_right_new = (
+    T(4) + "} else {" + NL
+    + T(5) + "// 右边缘拖出片段末尾：一直扩到素材结尾" + NL
+    + T(5) + "const baseDuration =" + NL
+    + T(6) + "resizing.initialDuration + resizing.initialTrimEnd / rate;" + NL
+    + T(5) + "const maxDuration =" + NL
+    + T(6) + "(sourceDuration - resizing.initialTrimStart) / rate;" + NL
+    + T(5) + "const newDuration = snapTimeToFrame({" + NL
+    + T(6) + "time: Math.max(" + NL
+    + T(7) + "baseDuration," + NL
+    + T(7) + "Math.min(baseDuration + Math.abs(newTrimEnd) / rate, maxDuration)," + NL
+    + T(6) + ")," + NL
+    + T(6) + "fps: projectFps," + NL
+    + T(5) + "});"
+)
+
+patch_text(
+    RESIZE_HOOK,
+    "sourceMediaDuration",
+    [
+        (
+            'import { useState, useEffect, useRef, useCallback } from "react";',
+            'import { useState, useEffect, useRef, useCallback, useMemo } from "react";',
+            1,
+        ),
+        (
+            T(1) + "const [resizing, setResizing] = useState<ResizeState | null>(null);",
+            _source_media_block
+            + NL
+            + T(1)
+            + "const [resizing, setResizing] = useState<ResizeState | null>(null);",
+            1,
+        ),
+        (_source_duration_old, _source_duration_new(3), 2),
+        (_left_old, _left_new, 1),
+        ("setCurrentTrimStart(newTrimStart);", "setCurrentTrimStart(appliedTrimStart);", 1),
+        (
+            "currentTrimStartRef.current = newTrimStart;",
+            "currentTrimStartRef.current = appliedTrimStart;",
+            1,
+        ),
+        (_right_old, _right_new, 1),
+    ],
+)
+
+
+# ------------------------------- 音频/字幕轨的体积碰撞（视频轨允许自由拉伸）
+COLLISION_LIB = SRC / "lib" / "timeline" / "collision.ts"
+COLLISION_LIB.parent.mkdir(parents=True, exist_ok=True)
+COLLISION_LIB.write_text(
+    tabsify(
+        """
+import type { TimelineTrack } from "@/types/timeline";
+
+const EPSILON = 1 / 1000;
+
+/**
+ * 会不会互相压：视频主轨是「自由画布」（可以随意重叠/拉伸），
+ * 音频、字幕、贴纸这些顺序排列，必须挡住彼此。
+ */
+export function trackHasCollision({ track }: { track: TimelineTrack }): boolean {
+  return track.type !== "video";
+}
+
+export type NeighborBounds = {
+  /** 能往左推到的最早时间（左侧邻居的结束点 / 0） */
+  minStartTime: number;
+  /** 能往右拉到的最晚时间（右侧邻居的开始点 / +∞） */
+  maxEndTime: number;
+};
+
+/** 同轨左右邻居给的边界；判定用元素「当前」位置，拖动跨邻居也不会乱。 */
+export function getNeighborBounds({
+  track,
+  elementId,
+  startTime,
+  duration,
+}: {
+  track: TimelineTrack;
+  elementId: string;
+  startTime: number;
+  duration: number;
+}): NeighborBounds {
+  if (!trackHasCollision({ track })) {
+    return { minStartTime: 0, maxEndTime: Number.POSITIVE_INFINITY };
+  }
+
+  const currentEnd = startTime + duration;
+  let minStartTime = 0;
+  let maxEndTime = Number.POSITIVE_INFINITY;
+
+  for (const other of track.elements) {
+    if (other.id === elementId) continue;
+    const otherEnd = other.startTime + other.duration;
+    if (otherEnd <= startTime + EPSILON) {
+      minStartTime = Math.max(minStartTime, otherEnd);
+      continue;
+    }
+    if (other.startTime >= currentEnd - EPSILON) {
+      maxEndTime = Math.min(maxEndTime, other.startTime);
+    }
+  }
+
+  return { minStartTime, maxEndTime };
+}
+
+/** 把「想拖到哪」压到同轨不重叠的位置；视频轨原样返回。 */
+export function clampStartTimeNoOverlap({
+  tracks,
+  trackId,
+  elementId,
+  requestedStartTime,
+  duration,
+}: {
+  tracks: TimelineTrack[];
+  trackId: string;
+  elementId: string;
+  requestedStartTime: number;
+  duration: number;
+}): number {
+  const track = tracks.find((item) => item.id === trackId);
+  if (!track || !trackHasCollision({ track })) {
+    return Math.max(0, requestedStartTime);
+  }
+
+  const element = track.elements.find((item) => item.id === elementId);
+  const bounds = getNeighborBounds({
+    track,
+    elementId,
+    startTime: element?.startTime ?? requestedStartTime,
+    duration: element?.duration ?? duration,
+  });
+  // 左右两侧都放不下（自身比空隙还长）时贴更近的一侧，别硬塞进邻居里
+  if (bounds.maxEndTime - duration < bounds.minStartTime) {
+    const toLeft = Math.abs(requestedStartTime - bounds.minStartTime);
+    const toRight = Math.abs(
+      bounds.maxEndTime - duration - requestedStartTime,
+    );
+    return toLeft <= toRight
+      ? bounds.minStartTime
+      : Math.max(0, bounds.maxEndTime - duration);
+  }
+
+  return Math.min(
+    Math.max(requestedStartTime, bounds.minStartTime),
+    bounds.maxEndTime - duration,
+  );
+}
+"""
+    )
+    + chr(10),
+    encoding="utf-8",
+)
+print(f"  wrote {COLLISION_LIB.relative_to(ROOT)} (轨道碰撞)")
+
+
+# 拖动片段：音频/字幕不许压到同轨别的片段
+ELEMENT_INTERACTION = SRC / "hooks" / "timeline" / "element" / "use-element-interaction.ts"
+patch_text(
+    ELEMENT_INTERACTION,
+    "clampStartTimeNoOverlap",
+    [
+        (
+            'import { useTimelineSnapping } from "@/hooks/timeline/use-timeline-snapping";',
+            'import { useTimelineSnapping } from "@/hooks/timeline/use-timeline-snapping";' + NL
+            + 'import { clampStartTimeNoOverlap } from "@/lib/timeline/collision";',
+            1,
+        ),
+        (
+            T(3) + "const frameSnappedTime = snapTimeToFrame({ time: adjustedTime, fps });",
+            T(3) + "const frameSnappedTime = snapTimeToFrame({ time: adjustedTime, fps });" + NL
+            + T(3) + "// 音频/字幕轨有体积碰撞：拖到邻居身上会被挡住" + NL
+            + T(3) + "const movingTrack = tracks.find(({ id }) => id === dragState.trackId);" + NL
+            + T(3) + "const movingElementForClamp = movingTrack?.elements.find(" + NL
+            + T(4) + "({ id }) => id === dragState.elementId," + NL
+            + T(3) + ");" + NL
+            + T(3) + "const collisionClampedTime =" + NL
+            + T(4) + "dragState.elementId && dragState.trackId && movingElementForClamp" + NL
+            + T(5) + "? clampStartTimeNoOverlap({" + NL
+            + T(6) + "tracks," + NL
+            + T(6) + "trackId: dragState.trackId," + NL
+            + T(6) + "elementId: dragState.elementId," + NL
+            + T(6) + "requestedStartTime: frameSnappedTime," + NL
+            + T(6) + "duration: movingElementForClamp.duration," + NL
+            + T(5) + "})" + NL
+            + T(5) + ": frameSnappedTime;",
+            1,
+        ),
+        (
+            T(3) + "const { snappedTime, snapPoint } = getDragSnapResult({" + NL
+            + T(4) + "frameSnappedTime,",
+            T(3) + "const { snappedTime: rawSnappedTime, snapPoint } = getDragSnapResult({" + NL
+            + T(4) + "frameSnappedTime: collisionClampedTime,",
+            1,
+        ),
+        (
+            T(3) + "setDragState((previousDragState) => ({" + NL
+            + T(4) + "...previousDragState," + NL
+            + T(4) + "currentTime: snappedTime,",
+            T(3) + "const snappedTime = rawSnappedTime;" + NL
+            + T(3) + "setDragState((previousDragState) => ({" + NL
+            + T(4) + "...previousDragState," + NL
+            + T(4) + "currentTime: snappedTime,",
+            1,
+        ),
+        (
+            T(3) + "const snappedTime = dragState.currentTime;",
+            T(3) + "const rawDropTime = dragState.currentTime;" + NL
+            + T(3) + "const dropElement = tracks" + NL
+            + T(4) + ".find(({ id }) => id === dragState.trackId)" + NL
+            + T(4) + "?.elements.find(({ id }) => id === dragState.elementId);" + NL
+            + T(3) + "// 落点再夹一次，保证提交值也合法" + NL
+            + T(3) + "const snappedTime =" + NL
+            + T(4) + "dragState.elementId && dragState.trackId && dropElement" + NL
+            + T(5) + "? clampStartTimeNoOverlap({" + NL
+            + T(6) + "tracks," + NL
+            + T(6) + "trackId: dragState.trackId," + NL
+            + T(6) + "elementId: dragState.elementId," + NL
+            + T(6) + "requestedStartTime: rawDropTime," + NL
+            + T(6) + "duration: dropElement.duration," + NL
+            + T(5) + "})" + NL
+            + T(5) + ": rawDropTime;",
+            1,
+        ),
+    ],
+)
+
+
+# 边缘拉伸：音频/字幕不许吃进邻居
+patch_text(
+    RESIZE_HOOK,
+    "neighborBounds",
+    [
+        (
+            'import { useTimelineStore } from "@/stores/timeline-store";',
+            'import { useTimelineStore } from "@/stores/timeline-store";' + NL
+            + 'import { getNeighborBounds } from "@/lib/timeline/collision";',
+            1,
+        ),
+        (
+            T(1) + "const [resizing, setResizing] = useState<ResizeState | null>(null);",
+            T(1) + "// 同轨左右邻居的边界（音频/字幕有体积碰撞，视频轨不限制）" + NL
+            + T(1) + "const neighborBounds = useMemo(" + NL
+            + T(2) + "() =>" + NL
+            + T(3) + "getNeighborBounds({" + NL
+            + T(4) + "track," + NL
+            + T(4) + "elementId: element.id," + NL
+            + T(4) + "startTime: element.startTime," + NL
+            + T(4) + "duration: element.duration," + NL
+            + T(3) + "})," + NL
+            + T(2) + "[track, element.id, element.startTime, element.duration]," + NL
+            + T(1) + ");" + NL
+            + T(1) + "const [resizing, setResizing] = useState<ResizeState | null>(null);",
+            1,
+        ),
+        (
+            T(4) + "const timelineDelta = Math.max(rawTrimDelta / rate, -resizing.initialStartTime);",
+            T(4) + "// 左扩不能越过左侧邻居，也不能越过时间轴 0 点" + NL
+            + T(4) + "const minLeftShift = Math.max(" + NL
+            + T(5) + "-resizing.initialStartTime," + NL
+            + T(5) + "neighborBounds.minStartTime - resizing.initialStartTime," + NL
+            + T(4) + ");" + NL
+            + T(4) + "const timelineDelta = Math.max(rawTrimDelta / rate, minLeftShift);",
+            1,
+        ),
+        (
+            T(5) + "const maxDuration =" + NL
+            + T(6) + "(sourceDuration - resizing.initialTrimStart) / rate;",
+            T(5) + "const maxDuration = Math.min(" + NL
+            + T(6) + "(sourceDuration - resizing.initialTrimStart) / rate," + NL
+            + T(6) + "neighborBounds.maxEndTime - resizing.initialStartTime," + NL
+            + T(5) + ");",
+            1,
+        ),
+        (
+            T(4) + "const clampedTrimEnd = Math.min(maxTrimEnd, Math.max(0, newTrimEnd));",
+            T(4) + "// 音频/字幕：右端也不许吃进右侧邻居（视频轨 maxEndTime 是 +∞，不受影响）" + NL
+            + T(4) + "const maxDurationByNeighbor =" + NL
+            + T(5) + "neighborBounds.maxEndTime - resizing.initialStartTime;" + NL
+            + T(4) + "const minTrimEndByNeighbor = Number.isFinite(maxDurationByNeighbor)" + NL
+            + T(5) + "? resizing.initialTrimEnd -" + NL
+            + T(6) + "(maxDurationByNeighbor - resizing.initialDuration) * rate" + NL
+            + T(5) + ": Number.NEGATIVE_INFINITY;" + NL
+            + T(4) + "const clampedTrimEnd = Math.min(" + NL
+            + T(5) + "maxTrimEnd," + NL
+            + T(5) + "Math.max(Math.max(0, minTrimEndByNeighbor), newTrimEnd)," + NL
+            + T(4) + ");",
+            1,
+        ),
+    ],
+)
+
+
+# 选中片段时，它两侧的「添加转场」加号让位，方便直接拖动
+patch_text(
+    SRC / "components" / "editor" / "panels" / "timeline" / "timeline-track.tsx",
+    "suppressedElementIds",
+    [
+        (
+            T(1) + "const { isElementSelected, clearElementSelection } = useElementSelection();",
+            T(1) + "const { isElementSelected, clearElementSelection, selectedElements } =" + NL
+            + T(2) + "useElementSelection();" + NL
+            + NL
+            + T(1) + "// 选中的片段：它两侧的「添加转场」加号会挡住拖动，先收起来" + NL
+            + T(1) + "const suppressedJunctionIds = selectedElements" + NL
+            + T(2) + ".filter((entry) => entry.trackId === track.id)" + NL
+            + T(2) + ".map((entry) => entry.elementId);",
+            1,
+        ),
+        (
+            T(7) + "<TrackTransitionOverlays" + NL
+            + T(8) + "track={track as VideoTrack}" + NL
+            + T(8) + "zoomLevel={zoomLevel}" + NL
+            + T(7) + "/>",
+            T(7) + "<TrackTransitionOverlays" + NL
+            + T(8) + "track={track as VideoTrack}" + NL
+            + T(8) + "zoomLevel={zoomLevel}" + NL
+            + T(8) + "suppressedElementIds={suppressedJunctionIds}" + NL
+            + T(7) + "/>",
+            1,
+        ),
+    ],
+)
+
+patch_text(
+    SRC / "components" / "editor" / "panels" / "timeline" / "timeline-transition-overlay.tsx",
+    "suppressedElementIds",
+    [
+        (
+            T(1) + "track," + NL + T(1) + "zoomLevel," + NL
+            + "}: {" + NL
+            + T(1) + "track: VideoTrack;" + NL
+            + T(1) + "zoomLevel: number;" + NL
+            + "}) {",
+            T(1) + "track," + NL + T(1) + "zoomLevel," + NL
+            + T(1) + "suppressedElementIds = []," + NL
+            + "}: {" + NL
+            + T(1) + "track: VideoTrack;" + NL
+            + T(1) + "zoomLevel: number;" + NL
+            + T(1) + "/** 这些元素被选中：与它们相邻的接缝先不显示加号，免得挡住拖动 */" + NL
+            + T(1) + "suppressedElementIds?: string[];" + NL
+            + "}) {",
+            1,
+        ),
+        (
+            T(3) + "{pairs.map((pair) => {" + NL
+            + T(4) + "const transition = getTransitionForPair({",
+            T(3) + "{pairs.map((pair) => {" + NL
+            + T(4) + "const suppressed =" + NL
+            + T(5) + "suppressedElementIds.includes(pair.from.id) ||" + NL
+            + T(5) + "suppressedElementIds.includes(pair.to.id);" + NL
+            + T(4) + "if (suppressed) return null;" + NL
+            + NL
+            + T(4) + "const transition = getTransitionForPair({",
+            1,
+        ),
+    ],
+)
+
+
+# ------------------------------- 字幕/文字的拉伸也要被邻居挡住（canExtend 分支）
+patch_text(
+    RESIZE_HOOK,
+    "maxExtensionByNeighbor",
+    [
+        (
+            T(5) + "const maxExtension = resizing.initialStartTime;",
+            T(5) + "// 字幕/文字能无限延长（maxExtensionByNeighbor），但同样不许吃进左邻居" + NL
+            + T(5) + "const maxExtension = Math.min(" + NL
+            + T(6) + "resizing.initialStartTime," + NL
+            + T(6) + "resizing.initialStartTime - neighborBounds.minStartTime," + NL
+            + T(5) + ");",
+            1,
+        ),
+        (
+            T(6) + "time: baseDuration + extensionNeeded,",
+            T(6) + "// 右端也不许吃进右邻居（视频轨 maxEndTime 是 +∞）" + NL
+            + T(6) + "time: Math.min(" + NL
+            + T(7) + "baseDuration + extensionNeeded," + NL
+            + T(7) + "neighborBounds.maxEndTime - resizing.initialStartTime," + NL
+            + T(6) + "),",
+            1,
+        ),
+    ],
+)
+
+
+# ------------------------------- 播放头吸附到裁剪点（小阈值 + 迟滞）
+PLAYHEAD_SNAPPING = SRC / "lib" / "timeline" / "playhead-snapping.ts"
+PLAYHEAD_SNAPPING.write_text(
+    tabsify(
+        """
+import type { TimelineTrack } from "@/types/timeline";
+
+export type PlayheadSnapResult = {
+  time: number;
+  snapTime: number | null;
+};
+
+/**
+ * 拖动播放头时吸附到片段裁剪点。
+ *
+ * 进吸附的阈值小（stickPx），一旦吸附住要挪出更远（releasePx）才脱开，
+ * 这样能明显感觉到「被吸住了」，又不会在稍远处乱跳。
+ */
+export function snapPlayheadTime({
+  tracks,
+  rawTime,
+  pixelsPerSecond,
+  activeSnapTime = null,
+  stickPx = 8,
+  releasePx = 14,
+}: {
+  tracks: TimelineTrack[];
+  rawTime: number;
+  pixelsPerSecond: number;
+  activeSnapTime?: number | null;
+  stickPx?: number;
+  releasePx?: number;
+}): PlayheadSnapResult {
+  if (pixelsPerSecond <= 0) {
+    return { time: rawTime, snapTime: null };
+  }
+
+  const stickSeconds = stickPx / pixelsPerSecond;
+  const releaseSeconds = releasePx / pixelsPerSecond;
+
+  // 已经吸附住：只有挪出 releaseSeconds 才脱开
+  if (
+    activeSnapTime !== null &&
+    Math.abs(rawTime - activeSnapTime) <= releaseSeconds
+  ) {
+    return { time: activeSnapTime, snapTime: activeSnapTime };
+  }
+
+  let best: number | null = null;
+  let bestDistance = stickSeconds;
+
+  for (const track of tracks) {
+    if ("hidden" in track && track.hidden) continue;
+    for (const element of track.elements) {
+      const candidates = [
+        element.startTime,
+        element.startTime + element.duration,
+      ];
+      for (const candidate of candidates) {
+        const distance = Math.abs(candidate - rawTime);
+        if (distance <= bestDistance) {
+          best = candidate;
+          bestDistance = distance;
+        }
+      }
+    }
+  }
+
+  if (best === null) {
+    return { time: rawTime, snapTime: null };
+  }
+  return { time: best, snapTime: best };
+}
+"""
+    )
+    + chr(10),
+    encoding="utf-8",
+)
+print(f"  wrote {PLAYHEAD_SNAPPING.relative_to(ROOT)} (播放头吸附)")
+
+
+# 拖动/点击播放头：帧对齐之后再吸附到裁剪点
+patch_text(
+    SRC / "hooks" / "timeline" / "use-timeline-playhead.ts",
+    "snapPlayheadTime",
+    [
+        (
+            'import { getSnappedSeekTime } from "@/lib/time";',
+            'import { getSnappedSeekTime } from "@/lib/time";' + NL
+            + 'import { snapPlayheadTime } from "@/lib/timeline/playhead-snapping";',
+            1,
+        ),
+        (
+            T(1) + "const lastMouseXRef = useRef<number>(0);",
+            T(1) + "const lastMouseXRef = useRef<number>(0);" + NL
+            + T(1) + "// 当前吸住的那个裁剪点（迟滞用）" + NL
+            + T(1) + "const snapTimeRef = useRef<number | null>(null);",
+            1,
+        ),
+        (
+            T(3) + "const time = getSnappedSeekTime({" + NL
+            + T(4) + "rawTime," + NL
+            + T(4) + "duration," + NL
+            + T(4) + "fps: framesPerSecond," + NL
+            + T(3) + "});" + NL
+            + NL
+            + T(3) + "setScrubTime(time);" + NL
+            + T(3) + "seek({ time });",
+            T(3) + "const frameTime = getSnappedSeekTime({" + NL
+            + T(4) + "rawTime," + NL
+            + T(4) + "duration," + NL
+            + T(4) + "fps: framesPerSecond," + NL
+            + T(3) + "});" + NL
+            + T(3) + "const snapped = snapPlayheadTime({" + NL
+            + T(4) + "tracks: editor.timeline.getTracks()," + NL
+            + T(4) + "rawTime: frameTime," + NL
+            + T(4) + "pixelsPerSecond: TIMELINE_CONSTANTS.PIXELS_PER_SECOND * zoomLevel," + NL
+            + T(4) + "activeSnapTime: snapTimeRef.current," + NL
+            + T(3) + "});" + NL
+            + T(3) + "snapTimeRef.current = snapped.snapTime;" + NL
+            + T(3) + "const time = snapped.time;" + NL
+            + NL
+            + T(3) + "setScrubTime(time);" + NL
+            + T(3) + "seek({ time });",
+            1,
+        ),
+        (
+            T(3) + "editor.playback.setScrubbing({ isScrubbing: false });" + NL
+            + T(3) + "if (scrubTime !== null) {",
+            T(3) + "editor.playback.setScrubbing({ isScrubbing: false });" + NL
+            + T(3) + "snapTimeRef.current = null;" + NL
+            + T(3) + "if (scrubTime !== null) {",
+            1,
+        ),
+    ],
+)
+
+patch_text(
+    SRC / "hooks" / "timeline" / "use-timeline-seek.ts",
+    "snapPlayheadTime",
+    [
+        (
+            'import { getSnappedSeekTime } from "@/lib/time";',
+            'import { getSnappedSeekTime } from "@/lib/time";' + NL
+            + 'import { snapPlayheadTime } from "@/lib/timeline/playhead-snapping";',
+            1,
+        ),
+        (
+            T(1) + "const mouseTrackingRef = useRef({" + NL,
+            T(1) + "// 当前吸住的那个裁剪点（迟滞用）" + NL
+            + T(1) + "const snapTimeRef = useRef<number | null>(null);" + NL
+            + T(1) + "const mouseTrackingRef = useRef({" + NL,
+            1,
+        ),
+        (
+            T(3) + "const time = getSnappedSeekTime({" + NL
+            + T(4) + "rawTime," + NL
+            + T(4) + "duration," + NL
+            + T(4) + "fps: projectFps," + NL
+            + T(3) + "});" + NL
+            + T(3) + "seek(time);",
+            T(3) + "const frameTime = getSnappedSeekTime({" + NL
+            + T(4) + "rawTime," + NL
+            + T(4) + "duration," + NL
+            + T(4) + "fps: projectFps," + NL
+            + T(3) + "});" + NL
+            + T(3) + "const snapped = snapPlayheadTime({" + NL
+            + T(4) + "tracks: editor.timeline.getTracks()," + NL
+            + T(4) + "rawTime: frameTime," + NL
+            + T(4) + "pixelsPerSecond: TIMELINE_CONSTANTS.PIXELS_PER_SECOND * zoomLevel," + NL
+            + T(4) + "activeSnapTime: snapTimeRef.current," + NL
+            + T(3) + "});" + NL
+            + T(3) + "snapTimeRef.current = snapped.snapTime;" + NL
+            + T(3) + "const time = snapped.time;" + NL
+            + T(3) + "seek(time);",
+            1,
+        ),
+    ],
+)
+
+
+# ---------------------------------------- 清掉未使用的 import（构建期 tsc 不检查）
+patch_text(
+    SRC / "components" / "editor" / "editor-header.tsx",
+    T(0) + "export function EditorHeader() {" + NL + T(1) + "return (",
+    [
+        (
+            T(0) + "export function EditorHeader() {" + NL
+            + T(1) + "const { t } = useTranslation();" + NL,
+            T(0) + "export function EditorHeader() {" + NL,
+            1,
+        ),
+    ],
+)
+
+patch_text(
+    SRC / "components" / "editor" / "panels" / "assets" / "views" / "captions.tsx",
+    "[storedModelId]",
+    [
+        (
+            T(1) + "const [storedModelId, setSelectedModelId] =" + NL,
+            T(1) + "const [storedModelId] =" + NL,
+            1,
+        ),
+    ],
+)
+
+
+# ------------------------------- 终态任务超时回收（渲染 / 人声美化的 job 表）
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _patch_plugin(path: Path, marker: str, edits) -> None:
+    """插件自己的 Python 文件（不在 ROOT 工作副本里）：幂等 + 次数校验。"""
+    text = path.read_text(encoding="utf-8")
+    if marker in text:
+        print(f"  keep    {path.name}")
+        return
+    for old, new, expect in edits:
+        count = text.count(old)
+        if count != expect:
+            raise SystemExit(
+                f"{path.name}: anchor {old[:70]!r} expected {expect}, got {count}"
+            )
+        text = text.replace(old, new)
+    path.write_text(text, encoding="utf-8")
+    print(f"  patched {path.name}")
+
+
+_patch_plugin(
+    PLUGIN_ROOT / "yuancut_render.py",
+    "_sweep_jobs",
+    [
+        (
+            "import tempfile" + NL + "import uuid",
+            "import tempfile" + NL + "import time" + NL + "import uuid",
+            1,
+        ),
+        (
+            "_JOBS: dict[str, dict] = {}",
+            "_JOBS: dict[str, dict] = {}" + NL
+            + NL
+            + "#: 终态任务留这么久，够客户端回来取结果；再久就回收，别让内存和临时目录越堆越多" + NL
+            + "_JOB_TTL_SECONDS = 30 * 60" + NL
+            + NL
+            + NL
+            + "def _sweep_jobs() -> None:" + NL
+            + "    now = time.time()" + NL
+            + "    for job_id, job in list(_JOBS.items()):" + NL
+            + '        if job.get("state") not in ("done", "error", "cancelled"):' + NL
+            + "            continue" + NL
+            + '        finished = job.get("finishedAt")' + NL
+            + "        if finished is None:" + NL
+            + '            job["finishedAt"] = now' + NL
+            + "            continue" + NL
+            + "        if now - finished < _JOB_TTL_SECONDS:" + NL
+            + "            continue" + NL
+            + '        work = job.get("work")' + NL
+            + "        if isinstance(work, Path):" + NL
+            + "            shutil.rmtree(work, ignore_errors=True)" + NL
+            + "        _JOBS.pop(job_id, None)",
+            1,
+        ),
+        (
+            "async def render_start(request: web.Request) -> web.Response:" + NL
+            + "    try:" + NL
+            + "        timeline = await request.json()",
+            "async def render_start(request: web.Request) -> web.Response:" + NL
+            + "    _sweep_jobs()" + NL
+            + "    try:" + NL
+            + "        timeline = await request.json()",
+            1,
+        ),
+    ],
+)
+
+_patch_plugin(
+    PLUGIN_ROOT / "yuancut_voice.py",
+    "_sweep_jobs",
+    [
+        (
+            "_worker_task: asyncio.Task | None = None",
+            "_worker_task: asyncio.Task | None = None" + NL
+            + NL
+            + "#: 终态任务留这么久，够客户端回来取结果；再久就回收" + NL
+            + "_JOB_TTL_SECONDS = 30 * 60" + NL
+            + NL
+            + NL
+            + "def _sweep_jobs() -> None:" + NL
+            + "    now = time.time()" + NL
+            + "    for job_id, job in list(_jobs.items()):" + NL
+            + '        if job.get("status") not in ("done", "error"):' + NL
+            + "            continue" + NL
+            + '        finished = job.get("finishedAt")' + NL
+            + "        if finished is None:" + NL
+            + '            job["finishedAt"] = now' + NL
+            + "            continue" + NL
+            + "        if now - finished < _JOB_TTL_SECONDS:" + NL
+            + "            continue" + NL
+            + '        workdir = job.get("workdir")' + NL
+            + "        if isinstance(workdir, Path):" + NL
+            + "            shutil.rmtree(workdir, ignore_errors=True)" + NL
+            + "        _jobs.pop(job_id, None)",
+            1,
+        ),
+        (
+            "async def voice_beautify(request: web.Request) -> web.Response:  # noqa: ANN001" + NL
+            + "    ok, reason = availability()",
+            "async def voice_beautify(request: web.Request) -> web.Response:  # noqa: ANN001" + NL
+            + "    _sweep_jobs()" + NL
+            + "    ok, reason = availability()",
+            1,
+        ),
+    ],
+)
+
+
+# ---------------------------------- 清掉上游自带、从未被引用的 import / 参数
+def strip_unused(path: Path, removals) -> None:
+    """按片段做纯删除；片段已经不在了就当已清理过（幂等）。"""
+    text = path.read_text(encoding="utf-8")
+    removed = 0
+    for chunk in removals:
+        if chunk in text:
+            text = text.replace(chunk, "", 1)
+            removed += 1
+    if removed:
+        path.write_text(text, encoding="utf-8")
+        print(f"  cleaned {path.relative_to(ROOT)} ({removed} 处)")
+    else:
+        print(f"  keep    {path.relative_to(ROOT)}")
+
+
+strip_unused(
+    SRC / "app" / "[locale]" / "projects" / "page.tsx",
+    [
+        T(1) + "BreadcrumbLink," + NL,
+        T(1) + "BreadcrumbSeparator," + NL,
+    ],
+)
+
+strip_unused(
+    SRC / "components" / "ui" / "alert.tsx",
+    ['import { AlertTriangle } from "lucide-react";' + NL],
+)
+
+strip_unused(
+    SRC / "components" / "ui" / "chart.tsx",
+    [
+        "import {" + NL
+        + T(1) + "NameType," + NL
+        + T(1) + "Payload," + NL
+        + T(1) + "ValueType," + NL
+        + '} from "recharts/types/component/DefaultTooltipContent";' + NL
+        + NL,
+    ],
+)
+
+patch_text(
+    SRC / "components" / "editor" / "panels" / "assets" / "views" / "settings.tsx",
+    'import { memo, useCallback, useMemo } from "react";',
+    [
+        (
+            'import { memo, useCallback, useMemo, useState } from "react";',
+            'import { memo, useCallback, useMemo } from "react";',
+            1,
+        ),
+        (T(1) + "FPS_PRESETS," + NL, "", 1),
+    ],
+)
+
+patch_text(
+    SRC / "components" / "ui" / "calendar.tsx",
+    "IconLeft: () =>",
+    [
+        ("IconLeft: ({ ...props }) =>", "IconLeft: () =>", 1),
+        ("IconRight: ({ ...props }) =>", "IconRight: () =>", 1),
+    ],
+)
+
+patch_text(
+    SRC / "core" / "managers" / "media-manager.ts",
+    "constructor(_editor: EditorCore) {}",
+    [
+        (
+            "constructor(private editor: EditorCore) {}",
+            "constructor(_editor: EditorCore) {}",
+            1,
+        ),
+    ],
+)
+
+
+# 轮询时也顺手回收过期任务（只 start 时清，失败任务可能一直躺到下次导出）
+_patch_plugin(
+    PLUGIN_ROOT / "yuancut_render.py",
+    '_sweep_jobs()' + NL + '    job = _job(request.query.get("jobId", ""))',
+    [
+        (
+            "async def render_progress(request: web.Request) -> web.Response:" + NL
+            + '    job = _job(request.query.get("jobId", ""))',
+            "async def render_progress(request: web.Request) -> web.Response:" + NL
+            + "    _sweep_jobs()" + NL
+            + '    job = _job(request.query.get("jobId", ""))',
+            1,
+        ),
+    ],
+)
+
+_patch_plugin(
+    PLUGIN_ROOT / "yuancut_voice.py",
+    "_sweep_jobs()" + NL + '    job_id = request.query.get("jobId", "")',
+    [
+        (
+            "async def voice_progress(request: web.Request) -> web.Response:  # noqa: ANN001" + NL
+            + '    job_id = request.query.get("jobId", "")',
+            "async def voice_progress(request: web.Request) -> web.Response:  # noqa: ANN001" + NL
+            + "    _sweep_jobs()" + NL
+            + '    job_id = request.query.get("jobId", "")',
+            1,
+        ),
+        (
+            '            f"[voice] 处理完成 {job[\'output\'].name}，用时 {time.time() - job[\'startedAt\']:.1f}s"' + NL
+            + "        )" + NL
+            + NL
+            + "def _refresh_progress(job: dict) -> None:",
+            '            f"[voice] 处理完成 {job[\'output\'].name}，用时 {time.time() - job[\'startedAt\']:.1f}s"' + NL
+            + "        )" + NL
+            + NL
+            + NL
+            + "def _refresh_progress(job: dict) -> None:",
+            1,
+        ),
+    ],
+)

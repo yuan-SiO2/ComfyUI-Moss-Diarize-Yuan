@@ -58,6 +58,17 @@ PLAYER_SRC = r'''// 纯播放器：只吃已渲染好的 PCM，不跑任何 DSP�
 let fifo = [];
 let fifoLen = 0;
 let playing = false;
+
+/**
+ * 软限幅：变速 + 音量叠加后峰值可能超过 1.0，直接交给声卡会硬削波（破音）。
+ * 0.95 以下原样通过，以上用 tanh 平滑压到 1.0 以内。
+ */
+function softClip(v) {
+	const a = Math.abs(v);
+	if (a <= 0.95) return v;
+	const limited = 0.95 + 0.05 * Math.tanh((a - 0.95) / 0.05);
+	return v < 0 ? -limited : limited;
+}
 let startAt = 0;
 
 class SonicPlayer extends AudioWorkletProcessor {
@@ -95,8 +106,8 @@ class SonicPlayer extends AudioWorkletProcessor {
 			const head = fifo[0];
 			const n = Math.min(frames - written, head.l.length - head.off);
 			for (let i = 0; i < n; i++) {
-				c0[written + i] = head.l[head.off + i];
-				c1[written + i] = head.r[head.off + i];
+				c0[written + i] = softClip(head.l[head.off + i]);
+				c1[written + i] = softClip(head.r[head.off + i]);
 			}
 			head.off += n;
 			written += n;
@@ -393,6 +404,8 @@ if _am:
 \t\t\tnextSourceTime: number;
 \t\t\trenderedEndTimeline: number;
 \t\t\tremainingTimeline: number;
+\t\t\t/** 正在渲染中：防止定时器和立即补渲染同时跑同一个 feeder */
+\t\t\tbusy: boolean;
 \t\t}
 \t>();
 \tprivate readonly sonicPlayers = new Map<string, PlayerNode>();
@@ -414,6 +427,7 @@ if _am:
 \t\tconst ctx = this.audioContext;
 \t\tif (!ctx || !this.editor.playback.getIsPlaying()) return;
 \t\tfor (const [key, feeder] of [...this.sonicFeeders]) {
+\t\t\tif (feeder.busy) continue;
 \t\t\tif (feeder.remainingTimeline <= 0.01) continue;
 \t\t\tconst played = ctx.currentTime - feeder.startAtCtx;
 \t\t\tif (played < 0) continue;
@@ -422,25 +436,33 @@ if _am:
 \t\t\t\tfeeder.startTimeline -
 \t\t\t\t(ctx.currentTime - feeder.startAtCtx);
 \t\t\tif (buffered() > 2) continue;
-\t\t\tlet guard = 0;
-\t\t\twhile (feeder.remainingTimeline > 0.01 && buffered() < 6 && guard++ < 4) {
-\t\t\t\tconst seconds = Math.min(
-\t\t\t\t\tchunkTimelineSeconds({ rate: feeder.rate }),
-\t\t\t\t\tfeeder.remainingTimeline,
-\t\t\t\t);
-\t\t\t\tconst chunk = await renderChunk({
-\t\t\t\t\tbuffer: feeder.buffer,
-\t\t\t\t\tstartTime: feeder.nextSourceTime,
-\t\t\t\t\tsourceSeconds: seconds * feeder.rate,
-\t\t\t\t\trate: feeder.rate,
-\t\t\t\t});
-\t\t\t\tif (!chunk) break;
-\t\t\t\t// 渲染期间可能被 stopPlayback / seek 清掉
-\t\t\t\tif (!this.sonicFeeders.has(key)) break;
-\t\t\t\tpushPcm({ node: feeder.node, left: chunk.left, right: chunk.right });
-\t\t\t\tfeeder.nextSourceTime += seconds * feeder.rate;
-\t\t\t\tfeeder.renderedEndTimeline += seconds;
-\t\t\t\tfeeder.remainingTimeline -= seconds;
+\t\t\tconst rate = feeder.rate;
+\t\t\tfeeder.busy = true;
+\t\t\ttry {
+\t\t\t\tlet guard = 0;
+\t\t\t\twhile (feeder.remainingTimeline > 0.01 && buffered() < 6 && guard++ < 4) {
+\t\t\t\t\tconst seconds = Math.min(
+\t\t\t\t\t\tchunkTimelineSeconds({ rate }),
+\t\t\t\t\t\tfeeder.remainingTimeline,
+\t\t\t\t\t);
+\t\t\t\t\tconst chunk = await renderChunk({
+\t\t\t\t\t\tbuffer: feeder.buffer,
+\t\t\t\t\t\tstartTime: feeder.nextSourceTime,
+\t\t\t\t\t\tsourceSeconds: seconds * rate,
+\t\t\t\t\t\trate,
+\t\t\t\t\t});
+\t\t\t\t\tif (!chunk) break;
+\t\t\t\t\t// 渲染期间可能被 seek / 改速 / 换素材重新排程：
+\t\t\t\t\t// 只有「同一个 feeder 对象、同一个速率」才允许把 PCM 推进播放器，
+\t\t\t\t\t// 否则这块数据会把播放器的 FIFO 顶乱（听感就是忽大忽小、破音、断音）
+\t\t\t\t\tif (this.sonicFeeders.get(key) !== feeder || feeder.rate !== rate) break;
+\t\t\t\t\tpushPcm({ node: feeder.node, left: chunk.left, right: chunk.right });
+\t\t\t\t\tfeeder.nextSourceTime += seconds * rate;
+\t\t\t\t\tfeeder.renderedEndTimeline += seconds;
+\t\t\t\t\tfeeder.remainingTimeline -= seconds;
+\t\t\t\t}
+\t\t\t} finally {
+\t\t\t\tfeeder.busy = false;
 \t\t\t}
 \t\t}
 \t}
@@ -511,7 +533,7 @@ if _am:
 \t\tvolume.connect(masterGain);
 \t\tplayFrom({ node: player, at: startAt });
 
-\t\tthis.sonicFeeders.set(key, {
+\t\t// 同片段可能因为 seek/改速被重新排程：旧 feeder 必须先摘掉，\n\t\t// 否则它在飞的渲染块会写进同一个播放器（PCM 乱序 = 破音/断音）\n\t\tthis.sonicFeeders.delete(key);\n\t\tthis.sonicFeeders.set(key, {
 \t\t\tnode: player,
 \t\t\tbuffer,
 \t\t\trate,
@@ -519,7 +541,7 @@ if _am:
 \t\t\tstartTimeline: timelineStart,
 \t\t\tnextSourceTime: sourceStart + firstSeconds * rate,
 \t\t\trenderedEndTimeline: timelineStart + firstSeconds,
-\t\t\tremainingTimeline: remainingDuration - firstSeconds,
+\t\t\tremainingTimeline: remainingDuration - firstSeconds,\n\t\t\tbusy: false,
 \t\t});
 \t\tthis.ensureSonicFeedTimer();
 \t\t// 立刻补一次，不等 250ms 定时器
