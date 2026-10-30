@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -772,6 +773,26 @@ async def render_selftest(request: web.Request) -> web.StreamResponse:
 # 一次 POST 拿不到中间进度，所以改成：start 建任务 -> progress 轮询 -> result 取文件
 _JOBS: dict[str, dict] = {}
 
+#: 终态任务留这么久，够客户端回来取结果；再久就回收，别让内存和临时目录越堆越多
+_JOB_TTL_SECONDS = 30 * 60
+
+
+def _sweep_jobs() -> None:
+    now = time.time()
+    for job_id, job in list(_JOBS.items()):
+        if job.get("state") not in ("done", "error", "cancelled"):
+            continue
+        finished = job.get("finishedAt")
+        if finished is None:
+            job["finishedAt"] = now
+            continue
+        if now - finished < _JOB_TTL_SECONDS:
+            continue
+        work = job.get("work")
+        if isinstance(work, Path):
+            shutil.rmtree(work, ignore_errors=True)
+        _JOBS.pop(job_id, None)
+
 
 def _job(job_id: str) -> dict | None:
     return _JOBS.get(job_id)
@@ -796,6 +817,7 @@ async def _render_job(job_id: str, timeline: dict, work: Path) -> None:
 
 
 async def render_start(request: web.Request) -> web.Response:
+    _sweep_jobs()
     try:
         timeline = await request.json()
     except Exception:
@@ -846,6 +868,7 @@ async def render_cancel(request: web.Request) -> web.Response:
 
 
 async def render_progress(request: web.Request) -> web.Response:
+    _sweep_jobs()
     job = _job(request.query.get("jobId", ""))
     if job is None:
         return web.json_response({"error": "任务不存在"}, status=404)

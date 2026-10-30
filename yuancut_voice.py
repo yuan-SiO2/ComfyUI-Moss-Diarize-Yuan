@@ -40,6 +40,26 @@ _jobs: dict[str, dict] = {}
 _queue: asyncio.Queue[str] | None = None
 _worker_task: asyncio.Task | None = None
 
+#: 终态任务留这么久，够客户端回来取结果；再久就回收
+_JOB_TTL_SECONDS = 30 * 60
+
+
+def _sweep_jobs() -> None:
+    now = time.time()
+    for job_id, job in list(_jobs.items()):
+        if job.get("status") not in ("done", "error"):
+            continue
+        finished = job.get("finishedAt")
+        if finished is None:
+            job["finishedAt"] = now
+            continue
+        if now - finished < _JOB_TTL_SECONDS:
+            continue
+        workdir = job.get("workdir")
+        if isinstance(workdir, Path):
+            shutil.rmtree(workdir, ignore_errors=True)
+        _jobs.pop(job_id, None)
+
 
 def _venv_python() -> Path:
     return VOICE_ROOT / "venv" / "bin" / "python"
@@ -166,6 +186,7 @@ async def _run_job(job_id: str) -> None:
             f"[voice] 处理完成 {job['output'].name}，用时 {time.time() - job['startedAt']:.1f}s"
         )
 
+
 def _refresh_progress(job: dict) -> None:
     path: Path = job["progressFile"]
     try:
@@ -208,6 +229,7 @@ async def voice_status(request: web.Request) -> web.Response:  # noqa: ANN001
 
 
 async def voice_beautify(request: web.Request) -> web.Response:  # noqa: ANN001
+    _sweep_jobs()
     ok, reason = availability()
     if not ok:
         return web.json_response({"error": reason}, status=503)
@@ -252,6 +274,7 @@ async def voice_beautify(request: web.Request) -> web.Response:  # noqa: ANN001
 
 
 async def voice_progress(request: web.Request) -> web.Response:  # noqa: ANN001
+    _sweep_jobs()
     job_id = request.query.get("jobId", "")
     job = _jobs.get(job_id)
     if job is None:
