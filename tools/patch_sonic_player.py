@@ -55,10 +55,6 @@ def patch(path: Path, old: str, new: str, *, required: bool = True) -> None:
 
 # --------------------------------------------------------------- 播放器 worklet
 PLAYER_SRC = r'''// 纯播放器：只吃已渲染好的 PCM，不跑任何 DSP。
-let fifo = [];
-let fifoLen = 0;
-let playing = false;
-
 /**
  * 软限幅：变速 + 音量叠加后峰值可能超过 1.0，直接交给声卡会硬削波（破音）。
  * 0.95 以下原样通过，以上用 tanh 平滑压到 1.0 以内。
@@ -69,23 +65,34 @@ function softClip(v) {
 	const limited = 0.95 + 0.05 * Math.tanh((a - 0.95) / 0.05);
 	return v < 0 ? -limited : limited;
 }
-let startAt = 0;
 
+/**
+ * 所有播放状态都必须是**实例字段**。
+ *
+ * AudioWorklet 的模块脚本在一个全局作用域里只求值一次，模块级变量由同一个
+ * 处理器的所有实例共享。之前把 fifo / playing / startAt 写在模块级，多个片段
+ * 各开一个播放器时它们会抢同一个 FIFO：谁先跑到 process 谁把 PCM 读走，
+ * 其余的只输出静音 —— 表现就是「多片段变速后只有一个有声，其余无声」。
+ */
 class SonicPlayer extends AudioWorkletProcessor {
 	constructor() {
 		super();
+		this.fifo = [];
+		this.fifoLen = 0;
+		this.playing = false;
+		this.startAt = 0;
 		this.port.onmessage = (event) => {
 			const msg = event.data;
 			if (msg.type === "pcm") {
-				fifo.push({ l: new Float32Array(msg.left), r: new Float32Array(msg.right), off: 0 });
-				fifoLen += msg.left.byteLength / 4;
+				this.fifo.push({ l: new Float32Array(msg.left), r: new Float32Array(msg.right), off: 0 });
+				this.fifoLen += msg.left.byteLength / 4;
 			} else if (msg.type === "start") {
-				startAt = msg.at || 0;
-				playing = true;
+				this.startAt = msg.at || 0;
+				this.playing = true;
 			} else if (msg.type === "clear") {
-				fifo = [];
-				fifoLen = 0;
-				playing = false;
+				this.fifo = [];
+				this.fifoLen = 0;
+				this.playing = false;
 			}
 		};
 	}
@@ -98,12 +105,12 @@ class SonicPlayer extends AudioWorkletProcessor {
 		const frames = c0.length;
 		c0.fill(0);
 		c1.fill(0);
-		if (!playing) return true;
-		if (currentTime + frames / sampleRate <= startAt) return true;
+		if (!this.playing) return true;
+		if (currentTime + frames / sampleRate <= this.startAt) return true;
 
 		let written = 0;
-		while (written < frames && fifo.length > 0) {
-			const head = fifo[0];
+		while (written < frames && this.fifo.length > 0) {
+			const head = this.fifo[0];
 			const n = Math.min(frames - written, head.l.length - head.off);
 			for (let i = 0; i < n; i++) {
 				c0[written + i] = softClip(head.l[head.off + i]);
@@ -111,8 +118,8 @@ class SonicPlayer extends AudioWorkletProcessor {
 			}
 			head.off += n;
 			written += n;
-			fifoLen -= n;
-			if (head.off >= head.l.length) fifo.shift();
+			this.fifoLen -= n;
+			if (head.off >= head.l.length) this.fifo.shift();
 		}
 		return true;
 	}
@@ -273,9 +280,33 @@ export async function renderChunk({
 
 /** 每次渲染覆盖的时间轴时长 */
 export function chunkTimelineSeconds({ rate }: { rate: number }): number {
+	// 分块长度与速度无关：变速只改变源消耗量，不改变一块覆盖的时间轴秒数。
+	// （rate 留在签名里是为了调用处可读，这里显式忽略。）
+	void rate;
 	return CHUNK_SECONDS;
 }
 
+
+/** 播放器 worklet 每个 AudioContext 只注册一次。 */
+const workletReady = new WeakMap<BaseAudioContext, Promise<boolean>>();
+
+function ensureWorklet(audioContext: BaseAudioContext): Promise<boolean> {
+	const ready = workletReady.get(audioContext);
+	if (ready) return ready;
+	const blob = new Blob([SONIC_PLAYER_SRC], { type: "text/javascript" });
+	const url = URL.createObjectURL(blob);
+	const pending = audioContext.audioWorklet
+		.addModule(url)
+		.then(() => true)
+		.catch((error: unknown) => {
+			// 注册失败就退回上游的 playbackRate 方式，至少还有声
+			console.warn("[time-stretch] 播放器 worklet 注册失败", error);
+			return false;
+		})
+		.finally(() => URL.revokeObjectURL(url));
+	workletReady.set(audioContext, pending);
+	return pending;
+}
 
 /** 创建一个纯播放器节点。 */
 export async function createPlayerNode({
@@ -283,17 +314,7 @@ export async function createPlayerNode({
 }: {
 	audioContext: BaseAudioContext;
 }): Promise<PlayerNode | null> {
-	const blob = new Blob([SONIC_PLAYER_SRC], { type: "text/javascript" });
-	const url = URL.createObjectURL(blob);
-	try {
-		await audioContext.audioWorklet.addModule(url);
-	} catch (error) {
-		// 同一个上下文重复注册同名处理器是允许的；真正的失败才报错
-		console.warn("[time-stretch] 播放器 worklet 注册失败", error);
-		return null;
-	} finally {
-		URL.revokeObjectURL(url);
-	}
+	if (!(await ensureWorklet(audioContext))) return null;
 
 	let node: AudioWorkletNode;
 	try {
@@ -574,5 +595,130 @@ if _am:
         AUDIO_MANAGER.write_text(_am, encoding="utf-8")
         print("  patched audio-manager.ts (scheduleSonicClip -> 渲染 + 续渲染泵 + 纯播放器)")
 
+
+# ------------------------------------- 多片段变速：解码缓存 + 播放器回收 + 不吞异常
+#
+# 之前改一个片段的速度就会走一遍「清解码缓存 → 全量重新解码 → 全量重排」，
+# 几百秒的 mp4 解码要 1~3 秒，那段时间就是掉音；几个片段一个个改速度，听感
+# 就是「先破音、然后彻底没声」。这里把解码缓存按文件对象判定新鲜度，
+# 只要素材没换就不重解码，重排成本降到毫秒级。
+
+
+def _edit_am(marker: str, old: str, new: str) -> None:
+    text = AUDIO_MANAGER.read_text(encoding="utf-8")
+    if marker in text:
+        print("  keep    audio-manager.ts")
+        return
+    if old not in text:
+        raise SystemExit(f"audio-manager anchor not found:\n{old[:200]}")
+    AUDIO_MANAGER.write_text(text.replace(old, new, 1), encoding="utf-8")
+    print("  patched audio-manager.ts")
+
+
+_edit_am(
+    "cached.file === clip.file",
+    "\tprivate decodedBuffers = new Map<string, AudioBuffer>();",
+    "\t// 按「素材文件对象」判定新鲜度：改速度 / 改裁剪都不会让缓存失效\n"
+    "\tprivate decodedBuffers = new Map<\n"
+    "\t\tstring,\n"
+    "\t\t{ file: File; buffer: AudioBuffer }\n"
+    "\t>();",
+)
+
+_edit_am(
+    "if (cached && cached.file === clip.file) return cached.buffer;",
+    "\t\tconst cached = this.decodedBuffers.get(clip.sourceKey);\n"
+    "\t\tif (cached) return cached;",
+    "\t\tconst cached = this.decodedBuffers.get(clip.sourceKey);\n"
+    "\t\tif (cached && cached.file === clip.file) return cached.buffer;",
+)
+
+_edit_am(
+    "this.decodedBuffers.set(clip.sourceKey, { file: clip.file, buffer });",
+    "\t\t\tthis.decodedBuffers.set(clip.sourceKey, buffer);",
+    "\t\t\tthis.decodedBuffers.set(clip.sourceKey, { file: clip.file, buffer });\n"
+    "\t\t\t// 只留最近 24 个素材，长时间编辑也不会把内存吃满\n"
+    "\t\t\twhile (this.decodedBuffers.size > 24) {\n"
+    "\t\t\t\tconst oldest = this.decodedBuffers.keys().next().value;\n"
+    "\t\t\t\tif (oldest === undefined) break;\n"
+    "\t\t\t\tthis.decodedBuffers.delete(oldest);\n"
+    "\t\t\t}",
+)
+
+_edit_am(
+    "// 不再清解码缓存",
+    "\t\tthis.timelineChangeTimer = window.setTimeout(() => {\n"
+    "\t\t\tthis.timelineChangeTimer = null;\n"
+    "\t\t\tthis.decodedBuffers.clear();\n",
+    "\t\tthis.timelineChangeTimer = window.setTimeout(() => {\n"
+    "\t\t\tthis.timelineChangeTimer = null;\n"
+    "\t\t\t// 不再清解码缓存：改速度/改裁剪用的还是同一批素材，\n"
+    "\t\t\t// 重复解码只会让每次重排都卡 1~3 秒（连续改速度时就是连续掉音）\n",
+)
+
+_edit_am(
+    "private pruneSonicPlayers()",
+    "\tprivate async scheduleSonicClip({",
+    "\t/** 时间轴上已经没有的片段：把它的播放器丢掉，别一直攒着。 */\n"
+    "\tprivate pruneSonicPlayers(): void {\n"
+    "\t\tconst alive = new Set(this.clips.map((clip) => clip.id));\n"
+    "\t\tfor (const key of [...this.sonicPlayers.keys()]) {\n"
+    "\t\t\tif (alive.has(key)) continue;\n"
+    "\t\t\tconst player = this.sonicPlayers.get(key);\n"
+    "\t\t\tthis.sonicPlayers.delete(key);\n"
+    "\t\t\tthis.sonicFeeders.delete(key);\n"
+    "\t\t\ttry {\n"
+    "\t\t\t\tplayer?.stop();\n"
+    "\t\t\t\tplayer?.disconnect();\n"
+    "\t\t\t} catch {}\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\n"
+    "\tprivate async scheduleSonicClip({",
+)
+
+_edit_am(
+    "this.pruneSonicPlayers();",
+    "\t\t\t} catch (error) {\n"
+    '\t\t\t\tconsole.warn("Failed to schedule audio clip:", clip.id, error);\n'
+    "\t\t\t}\n"
+    "\t\t}\n"
+    "\t}",
+    "\t\t\t} catch (error) {\n"
+    '\t\t\t\tconsole.warn("Failed to schedule audio clip:", clip.id, error);\n'
+    "\t\t\t}\n"
+    "\t\t}\n"
+    "\t\tthis.pruneSonicPlayers();\n"
+    "\t}",
+)
+
+_edit_am(
+    "await this.startPlaybackInner({ time });",
+    "\tprivate async startPlayback({ time }: { time: number }): Promise<void> {\n"
+    "\t\tconst audioContext = this.ensureAudioContext();\n"
+    "\t\tif (!audioContext) return;",
+    "\tprivate async startPlayback({ time }: { time: number }): Promise<void> {\n"
+    "\t\ttry {\n"
+    "\t\t\tawait this.startPlaybackInner({ time });\n"
+    "\t\t} catch (error) {\n"
+    "\t\t\t// 排程失败不能变成未捕获的 Promise：那样声音彻底没了还查不到原因\n"
+    '\t\t\tconsole.warn("[audio] 播放排程失败", error);\n'
+    "\t\t}\n"
+    "\t}\n"
+    "\n"
+    "\tprivate async startPlaybackInner({ time }: { time: number }): Promise<void> {\n"
+    "\t\tconst audioContext = this.ensureAudioContext();\n"
+    "\t\tif (!audioContext) return;",
+)
+
+_edit_am(
+    "feeder.remainingTimeline = 0;",
+    "\t\t\t\t\tif (!chunk) break;",
+    "\t\t\t\t\tif (!chunk) {\n"
+    "\t\t\t\t\t\t// 源已经读到头（或渲染失败）：标记播完，别再每 250ms 空转\n"
+    "\t\t\t\t\t\tfeeder.remainingTimeline = 0;\n"
+    "\t\t\t\t\t\tbreak;\n"
+    "\t\t\t\t\t}",
+)
 
 print("Done. sonic player patch applied.")

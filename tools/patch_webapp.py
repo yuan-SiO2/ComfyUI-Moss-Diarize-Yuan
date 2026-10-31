@@ -4590,19 +4590,23 @@ async function renderTimelineOnServer({
         if (element.type === "video" || element.type === "image") {
           const visual = element as unknown as {
             hidden?: boolean;
+            muted?: boolean;
             opacity?: number;
             trimStart?: number;
             transform?: { position?: { x: number; y: number }; scale?: number };
           };
           if (visual.hidden) continue;
           // 人声美化：视频换声音但不换画面 —— 画面这条静音，另加一条处理后的音频
+          // 分离音频（muted）后画面自己就没有声音了，不能再叠加一条处理后的音轨
           const beautify = element as unknown as {
             voiceBeautifyEnabled?: boolean;
             voiceBeautifyMediaId?: string;
             playbackRate?: number;
           };
           const beautifyMediaId =
-            beautify.voiceBeautifyEnabled && beautify.voiceBeautifyMediaId
+            !visual.muted &&
+            beautify.voiceBeautifyEnabled &&
+            beautify.voiceBeautifyMediaId
               ? beautify.voiceBeautifyMediaId
               : "";
           if (beautifyMediaId && !uploadedAssetIds.has(beautifyMediaId)) {
@@ -4623,7 +4627,7 @@ async function renderTimelineOnServer({
           elements.push({
             type: element.type,
             assetId: mediaId,
-            muted: beautifyMediaId ? true : undefined,
+            muted: beautifyMediaId || visual.muted ? true : undefined,
             start,
             duration: length,
             trimStart: visual.trimStart ?? 0,
@@ -6948,12 +6952,8 @@ VOCAL_ROW = VOICE_PANEL_DIR / "vocal-beautify-row.tsx"
 VOCAL_ROW_SOURCE = '''"use client";
 
 import { Slider } from "@/components/ui/slider";
-import {
-\tPropertyGroup,
-\tPropertyItem,
-\tPropertyItemLabel,
-\tPropertyItemValue,
-} from "./property-item";
+import { cn } from "@/utils/ui";
+import { PropertyItem, PropertyItemLabel, PropertyItemValue } from "./property-item";
 
 export function VocalBeautifyRow({
 \tenabled,
@@ -6981,30 +6981,33 @@ export function VocalBeautifyRow({
 \tconst percent = Math.round(strength * 100);
 \tconst done = Math.max(0, Math.min(1, progress ?? 0));
 \treturn (
-\t\t<PropertyGroup title="人声美化" collapsible={false}>
-\t\t\t<div className="space-y-2.5">
+\t\t<div className="flex flex-col border-t last:border-b">
+\t\t\t{/* 勾选框就在标题前面：不勾 = 灰的不可编辑，勾上 = 处理 */}
+\t\t\t<div className="flex items-center justify-between p-4">
+\t\t\t\t<label className="flex cursor-pointer items-center gap-1.5 select-none">
+\t\t\t\t\t<input
+\t\t\t\t\t\ttype="checkbox"
+\t\t\t\t\t\tclassName="accent-primary size-3.5 cursor-pointer"
+\t\t\t\t\t\tchecked={enabled}
+\t\t\t\t\t\tonChange={(event) => {
+\t\t\t\t\t\t\tonToggle(event.target.checked);
+\t\t\t\t\t\t}}
+\t\t\t\t\t/>
+\t\t\t\t\t<span
+\t\t\t\t\t\tclassName={cn(
+\t\t\t\t\t\t\t"text-xs font-medium",
+\t\t\t\t\t\t\tenabled ? "text-foreground" : "text-muted-foreground",
+\t\t\t\t\t\t)}
+\t\t\t\t\t>
+\t\t\t\t\t\t人声美化
+\t\t\t\t\t</span>
+\t\t\t\t</label>
+\t\t\t</div>
+\t\t\t<div className={cn("p-3 pt-0", enabled ? "" : "opacity-40")}>
 \t\t\t\t<PropertyItem>
-\t\t\t\t\t<PropertyItemLabel>
-\t\t\t\t\t\t<label className="flex cursor-pointer items-center gap-1.5 select-none">
-\t\t\t\t\t\t\t<input
-\t\t\t\t\t\t\t\ttype="checkbox"
-\t\t\t\t\t\t\t\tclassName="accent-primary size-3.5 cursor-pointer"
-\t\t\t\t\t\t\t\tchecked={enabled}
-\t\t\t\t\t\t\t\tonChange={(event) => {
-\t\t\t\t\t\t\t\t\tonToggle(event.target.checked);
-\t\t\t\t\t\t\t\t}}
-\t\t\t\t\t\t\t/>
-\t\t\t\t\t\t\t启用
-\t\t\t\t\t\t</label>
-\t\t\t\t\t</PropertyItemLabel>
+\t\t\t\t\t<PropertyItemLabel>强度</PropertyItemLabel>
 \t\t\t\t\t<PropertyItemValue>
-\t\t\t\t\t\t<div
-\t\t\t\t\t\t\tclassName={
-\t\t\t\t\t\t\t\tenabled
-\t\t\t\t\t\t\t\t\t? "flex items-center gap-2"
-\t\t\t\t\t\t\t\t\t: "flex items-center gap-2 opacity-40"
-\t\t\t\t\t\t\t}
-\t\t\t\t\t\t>
+\t\t\t\t\t\t<div className="flex items-center gap-2">
 \t\t\t\t\t\t\t<Slider
 \t\t\t\t\t\t\t\tvalue={[percent]}
 \t\t\t\t\t\t\t\tmin={0}
@@ -7022,36 +7025,38 @@ export function VocalBeautifyRow({
 \t\t\t\t\t\t</div>
 \t\t\t\t\t</PropertyItemValue>
 \t\t\t\t</PropertyItem>
-\t\t\t\t{busy ? (
-\t\t\t\t\t<div className="space-y-1">
-\t\t\t\t\t\t<div className="bg-accent h-1 w-full overflow-hidden rounded-full">
-\t\t\t\t\t\t\t<div
-\t\t\t\t\t\t\t\tclassName="bg-primary h-full rounded-full transition-[width] duration-300"
-\t\t\t\t\t\t\t\tstyle={{ width: `${Math.round(done * 100)}%` }}
-\t\t\t\t\t\t\t/>
-\t\t\t\t\t\t</div>
-\t\t\t\t\t\t<span className="text-foreground/80 block text-[11px] leading-tight">
-\t\t\t\t\t\t\t{status || "处理中…"}
+\t\t\t\t<div className="mt-2 space-y-1">
+\t\t\t\t\t{busy ? (
+\t\t\t\t\t\t<>
+\t\t\t\t\t\t\t<div className="bg-accent h-1 w-full overflow-hidden rounded-full">
+\t\t\t\t\t\t\t\t<div
+\t\t\t\t\t\t\t\t\tclassName="bg-primary h-full rounded-full transition-[width] duration-300"
+\t\t\t\t\t\t\t\t\tstyle={{ width: `${Math.round(done * 100)}%` }}
+\t\t\t\t\t\t\t\t/>
+\t\t\t\t\t\t\t</div>
+\t\t\t\t\t\t\t<span className="text-foreground/80 block text-[11px] leading-tight">
+\t\t\t\t\t\t\t\t{status || "处理中…"}
+\t\t\t\t\t\t\t</span>
+\t\t\t\t\t\t</>
+\t\t\t\t\t) : (
+\t\t\t\t\t\t<span className="text-muted-foreground block text-[11px] leading-tight">
+\t\t\t\t\t\t\t{enabled
+\t\t\t\t\t\t\t\t? status || "去混响 / 去喷麦 / 降噪 / 提升清晰度"
+\t\t\t\t\t\t\t\t: "不勾选保持原声"}
 \t\t\t\t\t\t</span>
-\t\t\t\t\t</div>
-\t\t\t\t) : (
-\t\t\t\t\t<span className="text-muted-foreground block text-[11px] leading-tight">
-\t\t\t\t\t\t{enabled
-\t\t\t\t\t\t\t? status || "去混响 / 去喷麦 / 降噪 / 提升清晰度"
-\t\t\t\t\t\t\t: "不勾选保持原声"}
-\t\t\t\t\t</span>
-\t\t\t\t)}
-\t\t\t\t{enabled && needsApply && !busy ? (
-\t\t\t\t\t<button
-\t\t\t\t\t\ttype="button"
-\t\t\t\t\t\tonClick={onApply}
-\t\t\t\t\t\tclassName="bg-accent hover:bg-accent/80 h-7 w-full rounded-sm px-2 text-xs"
-\t\t\t\t\t>
-\t\t\t\t\t\t按新强度重新处理
-\t\t\t\t\t</button>
-\t\t\t\t) : null}
+\t\t\t\t\t)}
+\t\t\t\t\t{enabled && needsApply && !busy ? (
+\t\t\t\t\t\t<button
+\t\t\t\t\t\t\ttype="button"
+\t\t\t\t\t\t\tonClick={onApply}
+\t\t\t\t\t\t\tclassName="bg-accent hover:bg-accent/80 h-7 w-full rounded-sm px-2 text-xs"
+\t\t\t\t\t\t>
+\t\t\t\t\t\t\t按新强度重新处理
+\t\t\t\t\t\t</button>
+\t\t\t\t\t) : null}
+\t\t\t\t</div>
 \t\t\t</div>
-\t\t</PropertyGroup>
+\t\t</div>
 \t);
 }
 '''
@@ -10064,6 +10069,1046 @@ _patch_plugin(
             + NL
             + NL
             + "def _refresh_progress(job: dict) -> None:",
+            1,
+        ),
+    ],
+)
+
+
+# =====================================================================
+# 框选 / 多选：键盘不再被文本选区吃掉 + 属性面板按「全部选中」生效
+# ---------------------------------------------------------------------
+# 1) 键盘：时间轴框选会在文档里留下一个文本选区。上游的规则是「文档里只要有
+#    选中的文字就跳过所有快捷键」，于是框选完按 Delete 经常没反应（有时又
+#    正常 —— 取决于上一次点击有没有清掉那个选区）。这里改成只看选区是不是
+#    落在可输入区域里，并且框选结束主动清掉残留选区。
+# 2) 属性面板：视频/音频/贴纸原来只对「第一个选中」生效。改成把改动分发到
+#    所有选中片段：变速按每个片段自己的当前速度换算时长，人声美化按素材去重
+#    后逐个处理再回填。
+# =====================================================================
+
+KEYBINDINGS = SRC / "hooks" / "use-keybindings.ts"
+
+patch_text(
+    KEYBINDINGS,
+    "function isSelectionInsideEditable()",
+    [
+        (
+            "export function useKeybindingsListener() {",
+            "/**\n"
+            " * 只有「选区在输入框 / 可编辑区里」才让快捷键让路。\n"
+            " * 时间轴框选、拖动片段都会在文档里留下一个文本选区，而这条路径上的\n"
+            " * 选区跟输入无关，不能因此把 Delete 之类的快捷键一起吞掉。\n"
+            " */\n"
+            "function isSelectionInsideEditable(): boolean {\n"
+            "\tconst selection = window.getSelection();\n"
+            "\tif (!selection || selection.isCollapsed || selection.rangeCount === 0) {\n"
+            "\t\treturn false;\n"
+            "\t}\n"
+            "\tconst anchor = selection.anchorNode;\n"
+            "\tconst element =\n"
+            "\t\tanchor instanceof Element ? anchor : (anchor?.parentElement ?? null);\n"
+            "\tif (!element) return false;\n"
+            "\treturn Boolean(\n"
+            "\t\telement.closest(\n"
+            "\t\t\t'input, textarea, [contenteditable=\"\"], [contenteditable=\"true\"], [data-keybinding-free]',\n"
+            "\t\t),\n"
+            "\t);\n"
+            "}\n"
+            "\n"
+            "export function useKeybindingsListener() {",
+            1,
+        ),
+        (
+            "\t\t\treturn (window.getSelection()?.toString().length ?? 0) > 0;",
+            "\t\t\treturn isSelectionInsideEditable();",
+            1,
+        ),
+    ],
+)
+
+SELECTION_BOX = SRC / "hooks" / "timeline" / "use-selection-box.ts"
+
+patch_text(
+    SELECTION_BOX,
+    "blockSelectStart",
+    [
+        (
+            "\t\t\tif (!isEnabled) return;\n"
+            "\n"
+            "\t\t\t// Keep the starting selection fixed while the box grows or shrinks.",
+            "\t\t\tif (!isEnabled) return;\n"
+            "\n"
+            "\t\t\t// 框选开始时清掉文档里残留的文本选区：\n"
+            "\t\t\t// 否则快捷键会被当成「用户正在选文字」而全部跳过\n"
+            "\t\t\twindow.getSelection()?.removeAllRanges();\n"
+            "\n"
+            "\t\t\t// Keep the starting selection fixed while the box grows or shrinks.",
+            1,
+        ),
+        (
+            "\t\tconst handleMouseUp = () => {\n"
+            "\t\t\tif (selectionBox?.isActive) {\n"
+            "\t\t\t\tjustFinishedSelectingRef.current = true;",
+            "\t\tconst handleMouseUp = () => {\n"
+            "\t\t\tif (selectionBox?.isActive) {\n"
+            "\t\t\t\t// 拖动本身可能顺手选中了片段名之类的文字，一并清掉\n"
+            "\t\t\t\twindow.getSelection()?.removeAllRanges();\n"
+            "\t\t\t\tjustFinishedSelectingRef.current = true;",
+            1,
+        ),
+        (
+            "\t\tdocument.body.style.userSelect = \"none\";\n"
+            "\t\tif (container) container.style.userSelect = \"none\";\n",
+            "\t\tdocument.body.style.userSelect = \"none\";\n"
+            "\t\tif (container) container.style.userSelect = \"none\";\n"
+            "\t\tconst blockSelectStart = (event: Event) => event.preventDefault();\n"
+            "\t\tdocument.addEventListener(\"selectstart\", blockSelectStart);\n",
+            1,
+        ),
+        (
+            "\t\t\tif (container) container.style.userSelect = previousContainerUserSelect;\n"
+            "\t\t};",
+            "\t\t\tif (container) container.style.userSelect = previousContainerUserSelect;\n"
+            "\t\t\tdocument.removeEventListener(\"selectstart\", blockSelectStart);\n"
+            "\t\t};",
+            1,
+        ),
+    ],
+)
+
+
+# ------------------------------------------------- 属性面板：多选集体编辑
+PROPERTIES_DIR = SRC / "components" / "editor" / "panels" / "properties"
+VIDEO_PROPERTIES = PROPERTIES_DIR / "video-properties.tsx"
+AUDIO_PROPERTIES = PROPERTIES_DIR / "audio-properties.tsx"
+STICKER_PROPERTIES = PROPERTIES_DIR / "sticker-properties.tsx"
+PROPERTIES_PANEL = PROPERTIES_DIR / "index.tsx"
+
+PROPERTIES_PANEL_TSX = r'''"use client";
+
+import { useMemo } from "react";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { AudioProperties } from "./audio-properties";
+import { VideoProperties } from "./video-properties";
+import { TextProperties } from "./text-properties";
+import { StickerProperties } from "./sticker-properties";
+import { EmptyView } from "./empty-view";
+import { useEditor } from "@/hooks/use-editor";
+import { useElementSelection } from "@/hooks/timeline/element/use-element-selection";
+import type {
+	AudioElement,
+	ImageElement,
+	StickerElement,
+	TextElement,
+	TimelineElement,
+	TimelineTrack,
+	VideoElement,
+} from "@/types/timeline";
+
+interface ElementWithTrack {
+	element: TimelineElement;
+	track: TimelineTrack;
+}
+
+function groupByType(items: ElementWithTrack[]) {
+	const groups: Record<string, ElementWithTrack[]> = {};
+	for (const item of items) {
+		const key = item.element.type;
+		if (!groups[key]) groups[key] = [];
+		groups[key].push(item);
+	}
+	return groups;
+}
+
+function toRefs(items: ElementWithTrack[]) {
+	return items.map((item) => ({ element: item.element, trackId: item.track.id }));
+}
+
+/**
+ * 属性面板：每个分组都把「整组选中片段」交给对应的面板，
+ * 面板内部对全部选中生效（数值显示取第一个，修改分发到所有）。
+ */
+export function PropertiesPanel() {
+	const editor = useEditor();
+	const { selectedElements } = useElementSelection();
+
+	const elementsWithTracks = editor.timeline.getElementsWithTracks({
+		elements: selectedElements,
+	});
+
+	const grouped = useMemo(
+		() => groupByType(elementsWithTracks),
+		[elementsWithTracks],
+	);
+
+	const total = selectedElements.length;
+
+	return (
+		<div className="panel bg-background h-full rounded-sm border overflow-hidden">
+			{total > 0 ? (
+				<div className="flex h-full flex-col">
+					{total > 1 ? (
+						<div className="text-muted-foreground border-b px-4 py-1.5 text-[11px] leading-tight">
+							已选 {total} 个片段：下面的修改会一起应用
+						</div>
+					) : null}
+					<ScrollArea className="min-h-0 flex-1">
+						{grouped.text && grouped.text.length > 0 && (
+							<TextProperties
+								elements={
+									toRefs(grouped.text) as unknown as {
+										element: TextElement;
+										trackId: string;
+									}[]
+								}
+							/>
+						)}
+						{grouped.video && grouped.video.length > 0 && (
+							<VideoProperties
+								elements={
+									toRefs(grouped.video) as unknown as {
+										element: VideoElement | ImageElement;
+										trackId: string;
+									}[]
+								}
+							/>
+						)}
+						{grouped.image && grouped.image.length > 0 && (
+							<VideoProperties
+								elements={
+									toRefs(grouped.image) as unknown as {
+										element: VideoElement | ImageElement;
+										trackId: string;
+									}[]
+								}
+							/>
+						)}
+						{grouped.audio && grouped.audio.length > 0 && (
+							<AudioProperties
+								elements={
+									toRefs(grouped.audio) as unknown as {
+										element: AudioElement;
+										trackId: string;
+									}[]
+								}
+							/>
+						)}
+						{grouped.sticker && grouped.sticker.length > 0 && (
+							<StickerProperties
+								elements={
+									toRefs(grouped.sticker) as unknown as {
+										element: StickerElement;
+										trackId: string;
+									}[]
+								}
+							/>
+						)}
+					</ScrollArea>
+				</div>
+			) : (
+				<EmptyView />
+			)}
+		</div>
+	);
+}
+'''
+
+write(PROPERTIES_PANEL, PROPERTIES_PANEL_TSX)
+
+
+# ---------------------------------------------------- 视频/图片属性：多选
+patch_text(
+    VIDEO_PROPERTIES,
+    'import { useEffect, useMemo, useReducer, useRef, useState } from "react";',
+    [
+        (
+            'import { useEffect, useReducer, useRef, useState } from "react";',
+            'import { useEffect, useMemo, useReducer, useRef, useState } from "react";',
+            1,
+        ),
+    ],
+)
+
+replace_between(
+    VIDEO_PROPERTIES,
+    "export function VideoProperties({",
+    "\tconst [beautifyBusy, setBeautifyBusy] = useState(false);",
+    r'''export function VideoProperties({
+	elements: elementRefs,
+}: {
+	elements: { element: VideoElement | ImageElement; trackId: string }[];
+}) {
+	// 数值显示取第一个选中片段；修改分发到全部选中片段（多选 = 集体操作）
+	const element = elementRefs[0].element;
+	const { t } = useTranslation();
+	const editor = useEditor();
+	const [, forceRender] = useReducer((x: number) => x + 1, 0);
+	const videoRefs = useMemo(
+		() =>
+			elementRefs.filter((ref) => ref.element.type === "video") as {
+				element: VideoElement;
+				trackId: string;
+			}[],
+		[elementRefs],
+	);''',
+    marker="elements: { element: VideoElement | ImageElement; trackId: string }[];",
+)
+
+replace_between(
+    VIDEO_PROPERTIES,
+    '\tconst probeAssetId = element.type === "video" ? element.mediaId : "";',
+    "\tconst beautifyStoredEnabled =",
+    r'''	const probeAssetIds = videoRefs.map((ref) => ref.element.mediaId).join("|");
+	useEffect(() => {
+		setAssetHasAudio(null);
+		// 多选时只要有一个选中素材带音轨，就允许做整组人声美化
+		const ids = probeAssetIds.split("|").filter(Boolean);
+		if (ids.length === 0) return;
+		let cancelled = false;
+		void (async () => {
+			for (const id of ids) {
+				const media =
+					editor.media.getAssets().find((asset) => asset.id === id) ?? null;
+				const pending = probeMediaHasAudio({ media });
+				if (!pending) continue;
+				const hasAudio = await pending;
+				if (cancelled) return;
+				if (hasAudio) {
+					setAssetHasAudio(true);
+					return;
+				}
+			}
+			if (!cancelled) setAssetHasAudio(false);
+		})();
+		return () => {
+			cancelled = true;
+		};
+	}, [editor, probeAssetIds]);
+
+''',
+    marker="// 多选时只要有一个选中素材带音轨",
+)
+
+patch_text(
+    VIDEO_PROPERTIES,
+    "videoRefs.every((ref) => ref.element.voiceBeautifyEnabled === true)",
+    [
+        (
+            '\tconst beautifyStoredEnabled =\n'
+            '\t\telement.type === "video" && element.voiceBeautifyEnabled === true;',
+            "\t// 勾选框反映整组状态：全部勾上才算勾上\n"
+            "\tconst beautifyStoredEnabled =\n"
+            "\t\tvideoRefs.length > 0 &&\n"
+            "\t\tvideoRefs.every((ref) => ref.element.voiceBeautifyEnabled === true);",
+            1,
+        ),
+    ],
+)
+
+replace_between(
+    VIDEO_PROPERTIES,
+    "\tconst updateClip = (updates: Partial<Record<string, unknown>>) => {",
+    "\tconst showBeautifyRow =",
+    r'''	const updateRefs = (
+		refs: { element: VideoElement | ImageElement; trackId: string }[],
+		updates: Partial<Record<string, unknown>>,
+		pushHistory = true,
+	) => {
+		if (refs.length === 0) return;
+		editor.timeline.updateElements({
+			updates: refs.map((ref) => ({
+				trackId: ref.trackId,
+				elementId: ref.element.id,
+				updates,
+			})),
+			pushHistory,
+		});
+	};
+
+	const updateBulk = (
+		updates: Partial<Record<string, unknown>>,
+		pushHistory = true,
+	) => {
+		updateRefs(elementRefs, updates, pushHistory);
+	};
+''',
+    marker="const updateRefs = (",
+)
+
+replace_between(
+    VIDEO_PROPERTIES,
+    "\tconst showBeautifyRow =",
+    "\tconst runVideoBeautify = async () => {",
+    r'''	const showBeautifyRow =
+		videoRefs.length > 0 &&
+		videoRefs.some((ref) => !ref.element.muted) &&
+		assetHasAudio === true;
+
+''',
+    marker="videoRefs.some((ref) => !ref.element.muted) &&",
+)
+
+
+replace_between(
+    VIDEO_PROPERTIES,
+    "\tconst runVideoBeautify = async () => {",
+    "\tconst isEditingScale = useRef(false);",
+    r'''	const runVideoBeautify = async () => {
+		if (beautifyBusy) return;
+		if (videoRefs.length === 0) return;
+		// 同一个素材只处理一次：结果是独立的 wav，几个片段共用同一份即可
+		const groups = new Map<
+			string,
+			{ element: VideoElement; trackId: string }[]
+		>();
+		for (const ref of videoRefs) {
+			if (ref.element.muted) continue;
+			const list = groups.get(ref.element.mediaId) ?? [];
+			list.push(ref);
+			groups.set(ref.element.mediaId, list);
+		}
+		if (groups.size === 0) {
+			setBeautifyOverride(null);
+			setBeautifyStatus("所选片段都是静音的，没有可处理的音轨");
+			return;
+		}
+		setBeautifyBusy(true);
+		setBeautifyProgress(0);
+		setBeautifyStatus("准备中…");
+		let index = 0;
+		let processed = 0;
+		let skipped = 0;
+		try {
+			for (const [mediaId, refs] of groups) {
+				index += 1;
+				const prefix =
+					groups.size > 1 ? `第 ${index}/${groups.size} 个素材 · ` : "";
+				const source = editor.media
+					.getAssets()
+					.find((asset) => asset.id === mediaId);
+				if (!source) {
+					skipped += refs.length;
+					continue;
+				}
+				const hasAudio = await probeMediaHasAudio({ media: source });
+				if (!hasAudio) {
+					skipped += refs.length;
+					continue;
+				}
+				const result = await applyVocalBeautify({
+					editor,
+					source,
+					strength: beautifyStrength,
+					onProgress: (state) => {
+						setBeautifyStatus(`${prefix}${describeVocalBeautify(state)}`);
+						setBeautifyProgress(
+							((index - 1) + (state.progress ?? 0)) / groups.size,
+						);
+					},
+				});
+				updateRefs(
+					refs,
+					{
+						voiceBeautifyEnabled: true,
+						voiceBeautifyMediaId: result.mediaId,
+						voiceBeautifyStrength: beautifyStrength,
+					},
+					true,
+				);
+				processed += refs.length;
+			}
+			setBeautifyStatus(
+				skipped > 0
+					? `已处理 ${processed} 个片段，${skipped} 个因没有音轨跳过`
+					: `已处理 ${processed} 个片段：画面不变，声音换成处理后的音轨`,
+			);
+		} catch (error) {
+			setBeautifyOverride(null);
+			setBeautifyStatus(`失败：${(error as Error).message}`);
+		} finally {
+			setBeautifyBusy(false);
+			setBeautifyProgress(null);
+		}
+	};
+
+	const toggleVideoBeautify = (checked: boolean) => {
+		if (beautifyBusy) return;
+		setBeautifyOverride(checked);
+		if (!checked) {
+			updateRefs(videoRefs, { voiceBeautifyEnabled: false }, true);
+			setBeautifyStatus("");
+			return;
+		}
+		const targets = videoRefs.filter((ref) => !ref.element.muted);
+		if (targets.length === 0) {
+			setBeautifyOverride(null);
+			setBeautifyStatus("所选片段都是静音的，没有可处理的音轨");
+			return;
+		}
+		if (targets.every((ref) => Boolean(ref.element.voiceBeautifyMediaId))) {
+			updateRefs(videoRefs, { voiceBeautifyEnabled: true }, true);
+			setBeautifyStatus("");
+			return;
+		}
+		void runVideoBeautify();
+	};
+
+''',
+    marker="第 ${index}/${groups.size} 个素材",
+)
+
+patch_text(
+    VIDEO_PROPERTIES,
+    "const isVideoElement = videoRefs.length > 0;",
+    [
+        (
+            '\tconst isVideoElement = element.type === "video";',
+            "\t// 选中的里有视频片段就显示速度那一组：改动会作用到全部视频片段\n"
+            "\tconst isVideoElement = videoRefs.length > 0;",
+            1,
+        ),
+    ],
+)
+
+replace_between(
+    VIDEO_PROPERTIES,
+    "\tconst applySpeedChange = ({",
+    "\tconst commitNumberField = ({",
+    r'''	const applySpeedChange = ({
+		newRate,
+		pushHistory,
+	}: {
+		newRate: number;
+		pushHistory: boolean;
+	}) => {
+		if (videoRefs.length === 0) return;
+		// 每个片段按自己的当前速度换算时长：多选就是一次性全改
+		editor.timeline.updateElements({
+			updates: videoRefs.map((ref) => {
+				const oldRate = ref.element.playbackRate ?? 1;
+				return {
+					trackId: ref.trackId,
+					elementId: ref.element.id,
+					updates: {
+						playbackRate: newRate,
+						duration: ref.element.duration * (oldRate / newRate),
+					},
+				};
+			}),
+			pushHistory,
+		});
+	};
+
+	const updateTransform = ({
+		updates,
+		pushHistory = true,
+	}: {
+		updates: Partial<typeof element.transform>;
+		pushHistory?: boolean;
+	}) => {
+		editor.timeline.updateElements({
+			updates: elementRefs.map((ref) => ({
+				trackId: ref.trackId,
+				elementId: ref.element.id,
+				updates: {
+					transform: { ...ref.element.transform, ...updates },
+				},
+			})),
+			pushHistory,
+		});
+	};
+
+''',
+    marker="每个片段按自己的当前速度换算时长",
+)
+
+# 透明度那 6 处内联更新也改成批量
+patch_re(
+    VIDEO_PROPERTIES,
+    r"editor\.timeline\.updateElements\(\{\s*updates: \[\s*\{\s*trackId,\s*elementId: element\.id,"
+    r"\s*updates: \{ opacity: (.+?) \},\s*\},\s*\],\s*pushHistory: (true|false),\s*\}\);",
+    r"updateBulk({ opacity: \1 }, \2);",
+    expect=6,
+)
+
+
+# ---------------------------------------------------- 音频属性：多选
+patch_text(
+    AUDIO_PROPERTIES,
+    'import { useEffect, useMemo, useReducer, useRef, useState } from "react";',
+    [
+        (
+            'import { useEffect, useReducer, useRef, useState } from "react";',
+            'import { useEffect, useMemo, useReducer, useRef, useState } from "react";',
+            1,
+        ),
+    ],
+)
+
+replace_between(
+    AUDIO_PROPERTIES,
+    "export function AudioProperties({",
+    "\tconst [beautifyBusy, setBeautifyBusy] = useState(false);",
+    r'''export function AudioProperties({
+	elements: elementRefs,
+}: {
+	elements: { element: AudioElement; trackId: string }[];
+}) {
+	// 数值显示取第一个选中片段；修改分发到全部选中片段（多选 = 集体操作）
+	const element = elementRefs[0].element;
+	const { t } = useTranslation();
+	const editor = useEditor();
+	const [, forceRender] = useReducer((x: number) => x + 1, 0);
+	const uploadRefs = useMemo(
+		() =>
+			elementRefs.filter(
+				(ref) => (ref.element as UploadAudioElement).sourceType === "upload",
+			) as { element: UploadAudioElement; trackId: string }[],
+		[elementRefs],
+	);
+''',
+    marker="elements: { element: AudioElement; trackId: string }[];",
+)
+
+replace_between(
+    AUDIO_PROPERTIES,
+    "\tconst updateElement = ({",
+    "\tconst applySpeedChange = ({",
+    r'''	const updateRefs = (
+		refs: { element: AudioElement; trackId: string }[],
+		updates: Partial<Record<string, unknown>>,
+		pushHistory = true,
+	) => {
+		if (refs.length === 0) return;
+		editor.timeline.updateElements({
+			updates: refs.map((ref) => ({
+				trackId: ref.trackId,
+				elementId: ref.element.id,
+				updates,
+			})),
+			pushHistory,
+		});
+	};
+
+	const updateElement = ({
+		updates,
+		pushHistory = true,
+	}: {
+		updates: Partial<Record<string, unknown>>;
+		pushHistory?: boolean;
+	}) => {
+		updateRefs(elementRefs, updates, pushHistory);
+	};
+
+''',
+    marker="const updateRefs = (\n\t\trefs: { element: AudioElement; trackId: string }[]",
+)
+
+replace_between(
+    AUDIO_PROPERTIES,
+    "\tconst applySpeedChange = ({",
+    "\tconst beautifySourceId =",
+    r'''	const applySpeedChange = ({
+		newRate,
+		pushHistory,
+	}: {
+		newRate: number;
+		pushHistory: boolean;
+	}) => {
+		// 每个片段按自己的当前速度换算时长：多选就是一次性全改
+		editor.timeline.updateElements({
+			updates: elementRefs.map((ref) => {
+				const oldRate = ref.element.playbackRate ?? 1;
+				return {
+					trackId: ref.trackId,
+					elementId: ref.element.id,
+					updates: {
+						playbackRate: newRate,
+						duration: ref.element.duration * (oldRate / newRate),
+					},
+				};
+			}),
+			pushHistory,
+		});
+	};
+
+''',
+    marker="// 每个片段按自己的当前速度换算时长：多选就是一次性全改",
+)
+
+patch_text(
+    AUDIO_PROPERTIES,
+    "// 勾选框反映整组状态：全部勾上才算勾上",
+    [
+        (
+            "\tconst beautifySourceId =\n"
+            "\t\t(element as UploadAudioElement).voiceBeautifySourceId ??\n"
+            "\t\t(element as UploadAudioElement).mediaId;\n"
+            "\tconst beautifyStoredEnabled =\n"
+            "\t\t(element as UploadAudioElement).voiceBeautifyEnabled ??\n"
+            "\t\tBoolean((element as UploadAudioElement).voiceBeautifySourceId);",
+            "\t// 勾选框反映整组状态：全部勾上才算勾上\n"
+            "\tconst beautifyStoredEnabled =\n"
+            "\t\tuploadRefs.length > 0 &&\n"
+            "\t\tuploadRefs.every(\n"
+            "\t\t\t(ref) =>\n"
+            "\t\t\t\tref.element.voiceBeautifyEnabled ??\n"
+            "\t\t\t\tBoolean(ref.element.voiceBeautifySourceId),\n"
+            "\t\t);",
+            1,
+        ),
+    ],
+)
+
+
+replace_between(
+    AUDIO_PROPERTIES,
+    "\tconst runVocalBeautify = async () => {",
+    '\treturn (\n\t\t<div className="flex h-full flex-col">',
+    r'''	const runVocalBeautify = async () => {
+		if (beautifyBusy) return;
+		if (uploadRefs.length === 0) {
+			setBeautifyOverride(null);
+			setBeautifyStatus("所选片段没有可处理的音频素材");
+			return;
+		}
+		// 同一份素材只处理一次，结果给所有引用它的片段共用
+		const groups = new Map<
+			string,
+			{ element: UploadAudioElement; trackId: string }[]
+		>();
+		for (const ref of uploadRefs) {
+			const key = ref.element.voiceBeautifySourceId ?? ref.element.mediaId;
+			const list = groups.get(key) ?? [];
+			list.push(ref);
+			groups.set(key, list);
+		}
+		setBeautifyBusy(true);
+		setBeautifyProgress(0);
+		setBeautifyStatus("准备中…");
+		let index = 0;
+		let processed = 0;
+		let skipped = 0;
+		try {
+			for (const [sourceId, refs] of groups) {
+				index += 1;
+				const prefix =
+					groups.size > 1 ? `第 ${index}/${groups.size} 个素材 · ` : "";
+				const source = editor.media
+					.getAssets()
+					.find((asset) => asset.id === sourceId);
+				if (!source) {
+					skipped += refs.length;
+					continue;
+				}
+				const result = await applyVocalBeautify({
+					editor,
+					source,
+					strength: beautifyStrength,
+					onProgress: (state) => {
+						setBeautifyStatus(`${prefix}${describeVocalBeautify(state)}`);
+						setBeautifyProgress(
+							((index - 1) + (state.progress ?? 0)) / groups.size,
+						);
+					},
+				});
+				updateRefs(
+					refs,
+					{
+						mediaId: result.mediaId,
+						name: result.name,
+						voiceBeautifyEnabled: true,
+						voiceBeautifyMediaId: result.mediaId,
+						voiceBeautifySourceId: sourceId,
+						voiceBeautifySourceName:
+							refs[0].element.voiceBeautifySourceName ?? refs[0].element.name,
+						voiceBeautifyStrength: beautifyStrength,
+					},
+					true,
+				);
+				processed += refs.length;
+			}
+			setBeautifyStatus(
+				skipped > 0
+					? `已处理 ${processed} 个片段，${skipped} 个跳过`
+					: `已处理 ${processed} 个片段：预览与导出都用处理后的音频`,
+			);
+		} catch (error) {
+			setBeautifyOverride(null);
+			setBeautifyStatus(`失败：${(error as Error).message}`);
+		} finally {
+			setBeautifyBusy(false);
+			setBeautifyProgress(null);
+		}
+	};
+
+	const toggleVocalBeautify = (checked: boolean) => {
+		if (beautifyBusy) return;
+		setBeautifyOverride(checked);
+		if (uploadRefs.length === 0) {
+			setBeautifyOverride(null);
+			setBeautifyStatus("所选片段没有可处理的音频素材");
+			return;
+		}
+		if (!checked) {
+			// 取消勾选：整组回到原始素材
+			editor.timeline.updateElements({
+				updates: uploadRefs.map((ref) => ({
+					trackId: ref.trackId,
+					elementId: ref.element.id,
+					updates: {
+						mediaId: ref.element.voiceBeautifySourceId ?? ref.element.mediaId,
+						name:
+							ref.element.voiceBeautifySourceName ??
+							ref.element.name.replace(/-人声美化(?=\.|$)/, ""),
+						voiceBeautifyEnabled: false,
+					},
+				})),
+				pushHistory: true,
+			});
+			setBeautifyStatus("");
+			return;
+		}
+		if (uploadRefs.every((ref) => Boolean(ref.element.voiceBeautifyMediaId))) {
+			editor.timeline.updateElements({
+				updates: uploadRefs.map((ref) => ({
+					trackId: ref.trackId,
+					elementId: ref.element.id,
+					updates: {
+						mediaId: ref.element.voiceBeautifyMediaId,
+						name:
+							editor.media
+								.getAssets()
+								.find(
+									(asset) => asset.id === ref.element.voiceBeautifyMediaId,
+								)?.name ?? ref.element.name,
+						voiceBeautifyEnabled: true,
+					},
+				})),
+				pushHistory: true,
+			});
+			setBeautifyStatus("");
+			return;
+		}
+		void runVocalBeautify();
+	};
+
+''',
+    marker="第 ${index}/${groups.size} 个素材 · ",
+)
+
+
+# ---------------------------------------------------- 贴纸属性：多选
+replace_between(
+    STICKER_PROPERTIES,
+    "export function StickerProperties({",
+    "\tconst { t } = useTranslation();",
+    r'''type StickerElementRef = { element: StickerElement; trackId: string };
+
+export function StickerProperties({
+	elements: elementRefs,
+}: {
+	elements: StickerElementRef[];
+}) {
+	// 数值显示取第一个选中片段；修改分发到全部选中片段（多选 = 集体操作）
+	const element = elementRefs[0].element;
+''',
+    marker="elements: StickerElementRef[];",
+)
+
+replace_between(
+    STICKER_PROPERTIES,
+    "\tconst updateElement = ({",
+    "\tconst commitNumberField = ({",
+    r'''	const updateRefs = (
+		refs: StickerElementRef[],
+		updates: Partial<Record<string, unknown>>,
+		pushHistory = true,
+	) => {
+		if (refs.length === 0) return;
+		editor.timeline.updateElements({
+			updates: refs.map((ref) => ({
+				trackId: ref.trackId,
+				elementId: ref.element.id,
+				updates,
+			})),
+			pushHistory,
+		});
+	};
+
+	const updateElement = ({
+		updates,
+		pushHistory = true,
+	}: {
+		updates: Partial<Record<string, unknown>>;
+		pushHistory?: boolean;
+	}) => {
+		updateRefs(elementRefs, updates, pushHistory);
+	};
+
+	const updateTransform = ({
+		updates,
+		pushHistory = true,
+	}: {
+		updates: Partial<typeof element.transform>;
+		pushHistory?: boolean;
+	}) => {
+		editor.timeline.updateElements({
+			updates: elementRefs.map((ref) => ({
+				trackId: ref.trackId,
+				elementId: ref.element.id,
+				updates: {
+					transform: { ...ref.element.transform, ...updates },
+				},
+			})),
+			pushHistory,
+		});
+	};
+
+''',
+    marker="const updateRefs = (\n\t\trefs: StickerElementRef[]",
+)
+
+
+# =====================================================================
+# 字幕转录：内置 MOSS 引擎 + 权重缺失自动下载（前端显示下载进度）
+# ---------------------------------------------------------------------
+# 后端（yuancut_transcribe.py + yuancut_asr/）已经不再依赖 custom_nodes 下的
+# ComfyUI-Moss-Diarize-Yuan 节点包：引擎和下载器都搬进了插件。
+# 这里补前端：转写前先问一下 `/yuancut/transcribe` 的状态，权重没就绪就把
+# 「模型下载中 x%」回显到面板上，而不是让用户看到一条 "找不到引擎" 的红字。
+# =====================================================================
+
+WORKER_RUNTIME = SRC / "services" / "transcription" / "worker-runtime.js"
+
+patch_text(
+    WORKER_RUNTIME,
+    "const STATUS_ENDPOINT = TRANSCRIBE_ENDPOINT;",
+    [
+        (
+            "const MAX_WINDOW_SECONDS = 300;\n",
+            "const MAX_WINDOW_SECONDS = 300;\n"
+            "// 同一个路由的 GET 返回引擎 / 权重状态（是否就绪、下载进度）\n"
+            "const STATUS_ENDPOINT = TRANSCRIBE_ENDPOINT;\n",
+            1,
+        ),
+        (
+            "\ttry {\n\t\tfor (let windowIndex = 0; windowIndex < windowCount; windowIndex++) {",
+            "\ttry {\n"
+            "\t\t// 首次使用时要先等权重就绪（1.8 GB，下载进度会回显到界面）\n"
+            "\t\tawait waitForModel();\n"
+            "\n"
+            "\t\tfor (let windowIndex = 0; windowIndex < windowCount; windowIndex++) {",
+            1,
+        ),
+        (
+            "\t} finally {\n\t\tactiveController = null;\n\t}\n}\n",
+            "\t} finally {\n\t\tactiveController = null;\n\t}\n}\n"
+            "\n"
+            "/**\n"
+            " * 等服务端权重就绪。\n"
+            " * 没说就绪就每 2 秒查一次状态，把下载进度当成「转写进度」发回去（带 label），\n"
+            " * 界面会显示「模型下载中 x%（a/b GiB）」。下完直接返回，继续正常转写。\n"
+            " */\n"
+            "async function waitForModel() {\n"
+            "\tfor (let attempt = 0; attempt < 900; attempt++) {\n"
+            "\t\tif (cancelled) return;\n"
+            "\t\tlet status = null;\n"
+            "\t\ttry {\n"
+            "\t\t\tconst response = await fetch(STATUS_ENDPOINT, { cache: \"no-store\" });\n"
+            "\t\t\tif (response.ok) status = await response.json();\n"
+            "\t\t} catch {\n"
+            "\t\t\t// 状态接口问不到就让 POST 自己去报错，别卡住转写\n"
+            "\t\t\treturn;\n"
+            "\t\t}\n"
+            "\t\tif (!status || status.model_ready) return;\n"
+            "\t\tif (status.download_error) {\n"
+            "\t\t\tthrow new Error(\"模型下载失败：\" + status.download_error);\n"
+            "\t\t}\n"
+            "\t\tconst done = Math.max(0, Math.min(1, Number(status.download_progress) || 0));\n"
+            "\t\tconst gib = (Number(status.downloaded_bytes) || 0) / 1024 ** 3;\n"
+            "\t\tconst total = (Number(status.total_bytes) || 0) / 1024 ** 3;\n"
+            "\t\tself.postMessage({\n"
+            "\t\t\ttype: \"transcribe-progress\",\n"
+            "\t\t\tprogress: Math.round(done * 100),\n"
+            "\t\t\tlabel:\n"
+            "\t\t\t\ttotal > 0\n"
+            "\t\t\t\t\t? \"模型下载中 \" +\n"
+            "\t\t\t\t\t  Math.round(done * 100) +\n"
+            "\t\t\t\t\t  \"%\uff08\" +\n"
+            "\t\t\t\t\t  gib.toFixed(2) +\n"
+            "\t\t\t\t\t  \"/\" +\n"
+            "\t\t\t\t\t  total.toFixed(2) +\n"
+            "\t\t\t\t\t  \" GiB\uff09\"\n"
+            "\t\t\t\t\t: \"模型下载中 \" + Math.round(done * 100) + \"%\",\n"
+            "\t\t});\n"
+            "\t\tawait new Promise((resolve) => setTimeout(resolve, 2000));\n"
+            "\t}\n"
+            "}\n",
+            1,
+        ),
+    ],
+)
+print("  patched worker-runtime.js（转写前等权重就绪 + 下载进度回显）")
+
+patch_text(
+    SRC / "services" / "transcription" / "worker.ts",
+    "| { type: \"transcribe-progress\"; progress: number; label?: string }",
+    [
+        (
+            '\t| { type: "transcribe-progress"; progress: number }',
+            "\t| { type: \"transcribe-progress\"; progress: number; label?: string }",
+            1,
+        ),
+    ],
+)
+
+patch_text(
+    SRC / "types" / "transcription.ts",
+    '"downloading-model"',
+    [
+        (
+            '\t| "loading-model"\n\t| "transcribing"',
+            '\t| "loading-model"\n\t| "downloading-model"\n\t| "transcribing"',
+            1,
+        ),
+    ],
+)
+
+patch_text(
+    SRC / "services" / "transcription" / "service.ts",
+    'status: response.label ? "downloading-model" : "transcribing",',
+    [
+        (
+            '\t\t\t\t\tcase "transcribe-progress":\n'
+            "\t\t\t\t\t\tonProgress?.({\n"
+            '\t\t\t\t\t\t\tstatus: "transcribing",\n'
+            "\t\t\t\t\t\t\tprogress: response.progress,\n"
+            "\t\t\t\t\t\t});",
+            '\t\t\t\t\tcase "transcribe-progress":\n'
+            "\t\t\t\t\t\tonProgress?.({\n"
+            '\t\t\t\t\t\t\t// 带 label 的是「权重还在下载」，不是真正的转写进度\n'
+            '\t\t\t\t\t\t\tstatus: response.label ? "downloading-model" : "transcribing",\n'
+            "\t\t\t\t\t\t\tprogress: response.progress,\n"
+            "\t\t\t\t\t\t\tmessage: response.label,\n"
+            "\t\t\t\t\t\t});",
+            1,
+        ),
+    ],
+)
+
+patch_text(
+    SRC / "components" / "editor" / "panels" / "assets" / "views" / "captions.tsx",
+    'progress.status === "downloading-model"',
+    [
+        (
+            '\t\t} else if (progress.status === "transcribing") {',
+            "\t\t} else if (progress.status === \"downloading-model\") {\n"
+            "\t\t\t// 首次使用：服务端在自动下载 1.8 GB 权重\n"
+            "\t\t\tsetProgressValue(overall);\n"
+            "\t\t\tsetProcessingStep(progress.message || t(\"Downloading model...\"));\n"
+            '\t\t} else if (progress.status === "transcribing") {',
             1,
         ),
     ],

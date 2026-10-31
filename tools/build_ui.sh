@@ -21,8 +21,15 @@ echo "==> copying web app source to $WORK/yuancut"
 rsync -a --exclude node_modules --exclude .git --exclude .next --exclude out \
   "$APP_SRC"/ "$WORK/yuancut"/
 
+echo "==> building Sonic wasm (变速不变调引擎)"
+bash "$HERE/tools/sonic/build_sonic_wasm.sh"
+
 echo "==> applying ComfyUI /yuancut patches"
 YUANCUT_WORK="$WORK/yuancut" python3 "$HERE/tools/patch_webapp.py"
+
+echo "==> applying time-stretch / tempo patches"
+YUANCUT_WORK="$WORK/yuancut" python3 "$HERE/tools/patch_time_stretch.py"
+YUANCUT_WORK="$WORK/yuancut" python3 "$HERE/tools/patch_sonic_player.py"
 
 echo "==> installing dependencies (pnpm)"
 # --ignore-scripts: sharp / onnxruntime postinstalls are not needed for a static

@@ -72,12 +72,14 @@ patch(
     EXPORT_BUTTON,
     "\t\t\t\t\tconst visual = element as unknown as {\n"
     "\t\t\t\t\t\thidden?: boolean;\n"
+    "\t\t\t\t\t\tmuted?: boolean;\n"
     "\t\t\t\t\t\topacity?: number;\n"
     "\t\t\t\t\t\ttrimStart?: number;\n"
     "\t\t\t\t\t\ttransform?: { position?: { x: number; y: number }; scale?: number };\n"
     "\t\t\t\t\t};",
     "\t\t\t\t\tconst visual = element as unknown as {\n"
     "\t\t\t\t\t\thidden?: boolean;\n"
+    "\t\t\t\t\t\tmuted?: boolean;\n"
     "\t\t\t\t\t\topacity?: number;\n"
     "\t\t\t\t\t\ttrimStart?: number;\n"
     "\t\t\t\t\t\tplaybackRate?: number;\n"
