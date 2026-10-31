@@ -5,3 +5,7 @@
 #   ffmpeg —— 浏览器（尤其 Linux 上的 Chromium）没有 AAC 音频编码器，
 #   MP4 导出时由本机 ffmpeg 把「无声视频 + WAV 音轨」交织封装成带 AAC 的 MP4。
 #   找不到 ffmpeg 时会退化成导出无声视频（编辑器里会有控制台警告）。
+
+# 字幕转录（yuancut_asr/）用到 torch / transformers / numpy：
+# 这些 ComfyUI 环境已经自带，所以不在这里固定版本，避免和 ComfyUI 自己的依赖打架。
+# 权重走 ComfyUI/models/Yuan_Cut/MOSS-Transcribe-Diarize，缺了会自动下载。

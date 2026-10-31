@@ -1,12 +1,24 @@
-"""字幕转录：把编辑器的字幕转写接到本地 MOSS-Transcribe-Diarize 模型上。
+"""字幕转录：把编辑器的字幕转写接到**插件内置**的 MOSS-Transcribe-Diarize 模型上。
 
-编辑器原本在浏览器里用 transformers.js 跑 Whisper（Small / Large v3 Turbo /
-Distil Small）。这里改成单一的「方法」：前端把 16 kHz 单声道 float32 波形 POST 到
-`/yuancut/transcribe`，由 ComfyUI 本机进程调用 MOSS-Transcribe-Diarize 推理，
-一次返回带说话人的句段（含起止时间），前端只负责画字幕。
+编辑器原来的 Whisper（Small / Large v3 Turbo / Distil Small）已在浏览器里下线。
+前端把 16 kHz 单声道 float32 波形 POST 到 `/yuancut/transcribe`，这里在本机进程里
+调用 MOSS 推理，一次返回带说话人的句段（含起止时间），前端只负责画字幕。
 
-引擎来源：custom_nodes 下已安装的 MOSS 节点包（优先带完整权重的
-`ComfyUI-Moss-Diarize-Yuan`），只借用它的 `moss_engine` 模块，不注册任何节点。
+引擎和权重下载器都在本插件的 `yuancut_asr/` 里，**不再依赖 custom_nodes 下的任何
+外部节点包**：
+
+  * `yuancut_asr/moss_engine.py`   —— 推理
+  * `yuancut_asr/moss_download.py` —— 权重供给
+
+权重默认放在 `ComfyUI/models/Yuan_Cut/MOSS-Transcribe-Diarize/`（约 1.8 GB），
+**检测不到就自动下载**（ModelScope 优先，失败回退 HuggingFace，断点续传），
+ComfyUI 启动时后台开始下，不影响启动速度。
+
+环境变量：
+
+  * `YUANCUT_MOSS_AUTODOWNLOAD=0` 关闭启动时自动下载（第一次转写时再下）
+  * `YUANCUT_MOSS_MODEL_DIR=/abs/path` 换权重目录
+  * `YUANCUT_MOSS_DOWNLOAD_SOURCE=modelscope|huggingface` 指定下载源
 """
 
 from __future__ import annotations
@@ -15,13 +27,12 @@ import asyncio
 import base64
 import importlib
 import logging
-import sys
 import threading
-import types
-from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from aiohttp import web
+
+from .yuancut_asr import moss_download as downloader
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +42,9 @@ SAMPLE_RATE = 16000
 
 # 单个请求最多接受的音频长度（秒），避免浏览器一次塞进几小时素材
 MAX_AUDIO_SECONDS = 3600.0
+
+# 首次转写时如果模型还没下完，最多等这么久（下载在后台线程里跑）
+MODEL_WAIT_SECONDS = 900.0
 
 _LANGUAGE_HINT = {
     "zh": "中文",
@@ -50,158 +64,74 @@ _engine_error: str | None = None
 _run_lock = threading.Lock()
 
 
-# --------------------------------------------------------------------- 引擎定位
-
-
-def _custom_node_roots() -> Iterator[Path]:
-    seen: set[Path] = set()
-
-    here = Path(__file__).resolve().parent
-    for candidate in (here.parent, here.parent.parent / "custom_nodes"):
-        if candidate.is_dir() and candidate not in seen:
-            seen.add(candidate)
-            yield candidate
-
-    try:
-        import folder_paths  # type: ignore
-
-        base = Path(folder_paths.base_path) / "custom_nodes"
-        if base.is_dir() and base not in seen:
-            seen.add(base)
-            yield base
-    except Exception:  # pragma: no cover - 非 ComfyUI 环境
-        return
-
-
-# 权重默认放在 ComfyUI/models/Yuan_Cut/MOSS-Transcribe-Diarize（与插件其它模型同目录）
-MODEL_FILES = ("config.json", "model-00000-of-00001.safetensors")
-
-
-def _models_root() -> Path | None:
-    """ComfyUI 的 models 目录；拿不到时退回 custom_nodes 的上级目录/models。"""
-    try:
-        import folder_paths  # type: ignore
-
-        root = Path(folder_paths.models_dir)
-        if root.is_dir():
-            return root
-    except Exception:  # pragma: no cover - 非 ComfyUI 环境
-        pass
-    for custom_nodes in _custom_node_roots():
-        candidate = custom_nodes.parent / "models"
-        if candidate.is_dir():
-            return candidate
-    return None
-
-
-def yuan_cut_model_dir() -> Path | None:
-    root = _models_root()
-    return None if root is None else root / "Yuan_Cut" / MODEL_NAME
-
-
-def _dir_ready(path: Path | None) -> bool:
-    return bool(path and path.is_dir() and all((path / name).is_file() for name in MODEL_FILES))
-
-
-def resolve_model_dir(pack: Path | None = None) -> Path | None:
-    """权重查找顺序：models/Yuan_Cut → 节点包自带 models 目录。"""
-    candidates = [yuan_cut_model_dir()]
-    if pack is not None:
-        candidates.append(pack / "models" / MODEL_NAME)
-    for candidate in candidates:
-        if _dir_ready(candidate):
-            return candidate
-    for candidate in candidates:
-        if candidate is not None and candidate.is_dir():
-            return candidate
-    return next((item for item in candidates if item is not None), None)
-
-
-def _apply_model_dir(engine: Any, pack: Path) -> Path | None:
-    """把引擎的模型目录指到 Yuan_Cut，缺失时下载也会落在那里。"""
-    model_dir = resolve_model_dir(pack)
-    download = getattr(engine, "moss_download", None)
-    if model_dir is not None and download is not None:
-        try:
-            model_dir.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:  # pragma: no cover - 只影响能否自动下载
-            pass
-        download.MODEL_ROOT = model_dir.parent
-        download.MODEL_DIR = model_dir
-    return model_dir
-
-
-def _pack_looks_ready(pack: Path) -> bool:
-    return (pack / "moss_engine.py").is_file() and _dir_ready(resolve_model_dir(pack))
-
-
-def find_engine_pack() -> Path | None:
-    """在 custom_nodes 中找带 moss_engine.py 的 MOSS 节点包，优先已就绪的。"""
-    ready: Path | None = None
-    any_pack: Path | None = None
-    for root in _custom_node_roots():
-        try:
-            entries = sorted(root.iterdir())
-        except OSError:
-            continue
-        for pack in entries:
-            if not pack.is_dir() or not (pack / "moss_engine.py").is_file():
-                continue
-            if not (pack / "moss_download.py").is_file():
-                continue
-            if _pack_looks_ready(pack):
-                return pack
-            any_pack = any_pack or pack
-    return ready or any_pack
-
-
-def _import_engine(pack: Path) -> Any:
-    """把 MOSS 包当成一个临时命名空间包导入，避开重复注册 ComfyUI 节点。"""
-    pkg_name = f"_yuancut_moss_engine_{abs(hash(str(pack))) & 0xFFFFFF:x}"
-    module = sys.modules.get(pkg_name)
-    if module is None:
-        module = types.ModuleType(pkg_name)
-        module.__path__ = [str(pack)]
-        sys.modules[pkg_name] = module
-    return importlib.import_module(f"{pkg_name}.moss_engine")
+# --------------------------------------------------------------------- 内置引擎
 
 
 def get_engine() -> Any:
+    """导入内置引擎模块（首次调用时才 import torch / transformers）。"""
     global _engine, _engine_error
     with _engine_lock:
         if _engine is not None:
             return _engine
         if _engine_error is not None:
             raise RuntimeError(_engine_error)
-        pack = find_engine_pack()
-        if pack is None:
-            _engine_error = (
-                "未找到 MOSS-Transcribe-Diarize 引擎：请把 ComfyUI-Moss-Diarize-Yuan "
-                "节点包放进 custom_nodes，权重放到 models/Yuan_Cut/MOSS-Transcribe-Diarize。"
-            )
-            raise RuntimeError(_engine_error)
         try:
-            _engine = _import_engine(pack)
-            model_dir = _apply_model_dir(_engine, pack)
-            logger.info("[YuanCut] 字幕转录引擎：%s（模型目录：%s）", pack, model_dir)
-            return _engine
+            module = importlib.import_module(f"{__package__}.yuancut_asr.moss_engine")
         except Exception as exc:  # pragma: no cover - 依赖缺失等
-            _engine_error = f"MOSS 引擎加载失败（{pack}）：{exc}"
+            _engine_error = (
+                f"内置 MOSS 引擎加载失败：{exc}（需要 torch / transformers / numpy）"
+            )
             raise RuntimeError(_engine_error) from exc
+        _engine = module
+        logger.info(
+            "[YuanCut] 字幕转录引擎：内置 yuancut_asr（权重目录：%s）",
+            downloader.MODEL_DIR,
+        )
+        return _engine
 
 
 def engine_status() -> dict[str, Any]:
-    pack = find_engine_pack()
-    model_dir = resolve_model_dir(pack)
+    state = downloader.progress()
     return {
         "model": MODEL_NAME,
-        "engine": str(pack) if pack else None,
-        "model_dir": str(model_dir) if model_dir else None,
-        "model_ready": _dir_ready(model_dir),
+        "engine": "内置 yuancut_asr",
+        "model_dir": state["directory"],
+        "model_ready": state["ready"],
+        "downloading": state["downloading"],
+        "download_progress": round(float(state["progress"]), 4),
+        "downloaded_bytes": state["downloaded_bytes"],
+        "total_bytes": state["total_bytes"],
+        "missing_files": state["missing"],
+        "download_source": state["source"],
+        "download_error": state["error"],
         "loaded": _engine is not None,
         "error": _engine_error,
         "sample_rate": SAMPLE_RATE,
     }
+
+
+async def _ensure_model() -> str | None:
+    """确保权重就绪；返回错误说明，就绪返回 None。"""
+    if downloader.is_ready():
+        return None
+
+    loop = asyncio.get_running_loop()
+    logger.info("[YuanCut] 字幕转录：权重缺失，开始下载到 %s", downloader.MODEL_DIR)
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(None, downloader.ensure, True),
+            timeout=MODEL_WAIT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        state = downloader.progress()
+        return (
+            f"MOSS 权重还在下载（{state['progress'] * 100:.0f}%，"
+            f"{state['downloaded_bytes'] / 1024 ** 3:.2f}/{state['total_bytes'] / 1024 ** 3:.2f} GiB）。"
+            "先关掉这个提示，等 ComfyUI 控制台打完「下载完成」再点一次「开始转写」。"
+        )
+    except Exception as exc:
+        return f"MOSS 权重下载失败：{exc}（可设置 YUANCUT_MOSS_MODEL_DIR 手动放权重）"
+    return None
 
 
 # --------------------------------------------------------------------- 推理
@@ -267,7 +197,12 @@ def _transcribe_sync(samples: Any, language: str) -> dict[str, Any]:
     if not segments and (result.get("text") or "").strip():
         # 模型没按格式输出时至少把整段文字当一条字幕
         segments.append(
-            {"start": 0.0, "end": round(duration, 3), "speaker": "", "text": result["text"].strip()}
+            {
+                "start": 0.0,
+                "end": round(duration, 3),
+                "speaker": "",
+                "text": result["text"].strip(),
+            }
         )
 
     return {
@@ -294,6 +229,13 @@ async def _handle_transcribe(request: web.Request) -> web.StreamResponse:
 
     language = str(payload.get("language") or "auto")
 
+    problem = await _ensure_model()
+    if problem is not None:
+        return web.json_response(
+            {"error": problem, **engine_status()},
+            status=503,
+        )
+
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, _transcribe_sync, samples, language)
@@ -310,7 +252,16 @@ async def _handle_status(request: web.Request) -> web.StreamResponse:
 def register_routes(routes: Any) -> None:
     routes.post(TRANSCRIBE_PATH)(_handle_transcribe)
     routes.get(TRANSCRIBE_PATH)(_handle_status)
-    logger.info("[YuanCut] 字幕转录使用 %s（POST %s）", MODEL_NAME, TRANSCRIBE_PATH)
+    logger.info(
+        "[YuanCut] 字幕转录使用内置 %s（权重：%s）",
+        MODEL_NAME,
+        downloader.MODEL_DIR,
+    )
+    # 模型缺失就在后台开始下载：启动不阻塞，用户点转写时通常已经下好
+    try:
+        downloader.start_background_provision()
+    except Exception as exc:  # pragma: no cover - 只是预取，失败不影响启动
+        logger.warning("[YuanCut] 字幕模型预取失败：%s", exc)
 
 
-__all__ = ["MODEL_NAME", "TRANSCRIBE_PATH", "register_routes", "engine_status", "find_engine_pack"]
+__all__ = ["MODEL_NAME", "TRANSCRIBE_PATH", "register_routes", "engine_status", "get_engine"]

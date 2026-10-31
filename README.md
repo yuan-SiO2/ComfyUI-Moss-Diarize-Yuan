@@ -213,6 +213,50 @@ tools/voice/setup_env.sh
 裁剪点（起点或终点）会被吸过去，进吸附阈值 8 px，已吸附后再挪 14 px 才脱开（迟滞），
 所以能明显感觉到「被吸住一下」，但稍远处又是自由拖动。
 
+## 多选与集体操作
+
+时间轴上**框选**（在空白处拖出选框）可以一次选中任意轨道的多个片段，选中的片段：
+
+- **一起拖动**：拖其中任意一个，整组跟着走（上游 `moveElementsByDelta`）
+- **一起在属性面板改**：面板顶部出现「已选 N 个片段：下面的修改会一起应用」，
+  数值取第一个选中片段，改动分发到整组：视频/图片（位置、缩放、旋转、透明度、速度、人声美化）、
+  音频（音量、速度、人声美化）、字幕/文字（字号、颜色、样式、变换）、贴纸（变换、透明度、颜色）
+- **一起改速度**：每个片段按**自己**的当前速度换算时长（`duration * 旧速度 / 新速度`），
+  所以 1x、2x 混选后一起调到 1.5x，时长各自按比例缩，不会出现某个片段时长算错
+- **一起人声美化**：按**素材**去重 —— 多个片段指向同一个素材只跑一次服务端任务，
+  处理完把同一个结果回填给这些片段；不同素材逐个处理，进度条显示「第 2/3 个素材 · 增强 40%」
+
+### 框选之后快捷键失灵（已修）
+
+上游 `use-keybindings.ts` 的规则是「文档里只要有选中的文字就跳过所有快捷键」。
+时间轴框选、拖动片段都会在文档里留下一个文本选区，于是框选完按 Delete 经常没反应
+（有时又正常 —— 取决于上一次点击有没有清掉那个选区）。
+
+现在：
+
+- 判定改成「选区是否落在 `input` / `textarea` / `contenteditable` 里」，浮在页面上的选区不再吞快捷键
+- 框选按下时清掉残留选区，拖动期间 `selectstart` 直接 `preventDefault`，松开再清一次
+
+实测：框选 3 段 → `window.getSelection()` 长度 0 → Delete 删掉 3 段；
+故意先选中整页文字（221 字符）再按 Delete 也能删；焦点在输入框里按 Delete 仍然只删文字、不动片段。
+
+### 多个片段变速时「破音 / 变无声」（已修）
+
+两个独立的原因，都在 Sonic 变速这条链上：
+
+1. **播放器 worklet 的状态写在模块作用域**（`sonic-player-source.ts` 里的 `fifo` / `playing` / `startAt`）。
+   AudioWorklet 的模块脚本在一个全局作用域里只求值一次，模块级变量由**同一个处理器的所有实例共享** ——
+   每个片段各开一个播放器时，它们抢同一个 FIFO：谁先跑到 `process` 谁把 PCM 读走，其余只输出静音。
+   实测（3 段 1.5x / 0.5x / 2x，RMS 每 0.5 s 采样）：修之前只有最后一段有声，前 16 s 全是 0；
+   改成实例字段后 0–18 s 连续 0.0108~0.0111，无静音采样。
+2. **每次时间轴变化都清空解码缓存**（`handleTimelineChange` 里的 `decodedBuffers.clear()`）。
+   改一个片段的速度就会把整条素材重新解码一遍，几百秒的 mp4 要 1~3 秒，那段时间就是掉音；
+   几个片段挨个改，听感就是「先破音、然后彻底没声」。
+   现在缓存按**素材文件对象**判定新鲜度（素材没换就不重解码），只保留最近 24 个素材。
+   实测：播放中连续改 3 个片段的速度，最长连续静音 **0 ms**，峰值 0.016 无削波。
+
+顺带把播放器 worklet 改成**每个 AudioContext 只注册一次**，并回收时间轴上已删除片段的播放器。
+
 ## 相邻片段之间的缝
 
 同一条轨道上**首尾相接**的两段之间画一条 2 px 深色缝（`borderRight`，走 border-box，
@@ -268,22 +312,32 @@ tools/voice/setup_env.sh
 
 ## 语音转字幕
 
-字幕转录只有一个方法：**本机 MOSS-Transcribe-Diarize 模型**（原来的 Whisper
+字幕转录只有一个方法：**插件内置的 MOSS-Transcribe-Diarize 模型**（原来的 Whisper
 Small / Large v3 Turbo / Distil Small 三个浏览器模型已全部删除）。
 
 - 前端只做音频准备：把片段解码成 16 kHz 单声道 Float32，每 5 分钟一块 POST 到
   `/yuancut/transcribe`，再把返回的句段画成字幕
 - 后端（`yuancut_transcribe.py`）在本机调用 MOSS 推理，一次拿到「说话人 + 起止时间 + 文本」，
   不需要浏览器下载权重，也不依赖 WebGPU/WASM
-- 权重放在 **`ComfyUI/models/Yuan_Cut/MOSS-Transcribe-Diarize/`**（约 1.8 GB）；
-  节点包 `custom_nodes/ComfyUI-Moss-Diarize-Yuan/models/MOSS-Transcribe-Diarize`
-  现在是指向该目录的软链接，MOSS 节点和字幕转录共用同一份权重
-- 引擎来自 `custom_nodes` 下的 MOSS 节点包（`moss_engine.py`），只借用它的推理代码，
-  不注册任何 ComfyUI 节点；找不到 Yuan_Cut 权重时回退到节点包自带目录
-- `GET /yuancut/transcribe` 返回引擎状态（是否找到模型包、权重是否就绪），便于排查
+- **引擎和权重下载器都内置在本插件里**（`yuancut_asr/moss_engine.py`、`yuancut_asr/moss_download.py`），
+  不再需要 `custom_nodes/ComfyUI-Moss-Diarize-Yuan` 这类外部节点包，删掉它也不影响转写
+- 权重放在 **`ComfyUI/models/Yuan_Cut/MOSS-Transcribe-Diarize/`**（约 1.8 GB）。
+  **检测不到就自动下载**：ModelScope 国内源优先，失败回退 HuggingFace（huggingface.co → hf-mirror.com），
+  逐文件断点续传，下完做字节数校验；ComfyUI 启动时就在后台开始下，不阻塞启动
+- 第一次点「开始转写」时如果权重还在下，面板会显示「模型下载中 12%（0.21/1.83 GiB）」，
+  下完自动接着转写；控制台同时每 5 秒打印一次进度
+- 环境变量：`YUANCUT_MOSS_AUTODOWNLOAD=0` 关闭启动时自动下载、
+  `YUANCUT_MOSS_MODEL_DIR=/abs/path` 换权重目录、
+  `YUANCUT_MOSS_DOWNLOAD_SOURCE=modelscope|huggingface` 指定下载源
+- `GET /yuancut/transcribe` 返回引擎与下载状态（`model_ready` / `downloading` /
+  `download_progress` / `missing_files` / `download_error`），便于排查
 - 模型首次转写时载入并常驻显存（BF16 + SDPA），之后重复转写不再重新加载
 - 单次请求上限 5 分钟音频，长素材由前端自动分块并拼接时间轴；后端最多接受 1 小时
-- 改了 `yuancut_transcribe.py` 或新增路由后需要重启 ComfyUI；只换前端静态文件不用重启
+- 改了 `yuancut_transcribe.py` / `yuancut_asr/` 或新增路由后需要重启 ComfyUI；
+  只换前端静态文件不用重启
+
+实测（RTX 3090，8 秒中文素材）：模型加载 2.0 s，转写 5.6 s，返回
+`[S01] 0.00–6.14 s` 一条带说话人的句段。
 
 字幕断句（中文/日文）：上游按空格分词，中文没有空格会把整段变成一条超长字幕，
 所以补了一套按字切分（`lib/transcription/caption-text.ts`）：
