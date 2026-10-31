@@ -490,6 +490,21 @@ async def _run_render(
 
     work_dir = work or Path(tempfile.mkdtemp(prefix="yuancut-render-"))
     output = work_dir / "out.mp4"
+
+    # 调整 / 滤镜：客户端把参数压成一份 .cube 随请求带来，这里只加一步 lut3d。
+    # 预览用的是同一份 cube，所以两边不会出现两套公式。
+    lut_text = timeline.get("lut")
+    if isinstance(lut_text, str) and lut_text.strip():
+        cube_path = work_dir / "grade.cube"
+        try:
+            cube_path.write_text(lut_text, encoding="utf-8")
+            escaped = str(cube_path).replace("\\", "/").replace("'", "'\\''")
+            filter_complex = (
+                f"{filter_complex};[{video_out}]lut3d='{escaped}'[v_lut]"
+            )
+            video_out = "v_lut"
+        except OSError:
+            pass
     total_frames = max(1, int(duration * fps))
 
     args = [

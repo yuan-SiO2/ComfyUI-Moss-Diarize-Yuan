@@ -435,3 +435,22 @@ Small / Large v3 Turbo / Distil Small 三个浏览器模型已全部删除）。
 
 插件代码：MIT。内置前端来自一个 MIT 许可的开源视频编辑器，原始版权与许可声明
 保留在 [LICENSE](LICENSE)，分发时请一并保留。
+
+### 导出侧接线（已完成）
+
+`yuancut_render.py` 支持请求里带 `lut`（.cube 文本）：
+
+```python
+# 渲染时追加一步，其余 filter_complex 不变
+filter_complex += f";[{video_out}]lut3d='{cube_path}'[v_lut]"
+```
+
+实测（320×180、1 s、真实 mp4 素材，同一时间线渲染两次）：
+
+| | 平均亮度 | 说明 |
+|---|---|---|
+| 不带 LUT | 125.7 | 基线 |
+| 带 LUT（brightness=70） | 128.0 | 首帧逐像素差 mean 2.86 / max 87 |
+
+注意：`lut3d` 的文件参数是**位置参数**（`lut3d='x.cube'`），写成 `filename=` 会报
+`Error applying option 'filename' to filter 'lut3d': Option not found`。
